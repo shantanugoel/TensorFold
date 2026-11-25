@@ -97,6 +97,9 @@ pub fn finishCuda(ck: *core.Checkpoint, model: config.Model) !void {
     var ownership: CudaOwnership = .{ .checkpoint = ck };
     // Only the names matter here; four bits keeps the shared enumerator's logical dimensions valid.
     try weights.checkCudaAuxiliary(&ownership, model, 4);
+    // The vision tower and the DFly2 drafter wait for their own CUDA consumers (plan 7.8/7.9): skipped on purpose.
+    try ck.skip("vit.");
+    try ck.skip("model.dfly_layers.");
     try refuseLeftovers(ck, error.UnusedHy4Tensors);
 }
 

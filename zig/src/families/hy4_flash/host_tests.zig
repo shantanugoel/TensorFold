@@ -112,7 +112,7 @@ const auxiliary_entries = [_]core.checkpoint_fixture.Entry{
 
 const auxiliary_wide_data = [4]u8{ 0, 0, 0, 0 };
 
-test "the CUDA loader owns complete auxiliary tensors but refuses a stray" {
+test "the CUDA loader owns the auxiliary tensors it leaves out and refuses a stray" {
     const fixture = core.checkpoint_fixture;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -126,20 +126,26 @@ test "the CUDA loader owns complete auxiliary tensors but refuses a stray" {
     model.dfly_num_hidden_layers = 1;
     model.dfly_target_index_layer = &.{0};
     model.dfly_target_kv_layers = &.{0};
-    for ([_]bool{ false, true }) |with_stray| {
+    // The vision tower and the drafter are skipped by prefix on CUDA until their consumers land; all else refuses.
+    const strays = [_]struct { name: []const u8, refused: bool }{
+        .{ .name = "model.stray.weight", .refused = true },
+        .{ .name = "vit.stray.weight", .refused = false },
+        .{ .name = "model.dfly_layers.stray.weight", .refused = false },
+    };
+    for (strays) |stray| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var entries: std.ArrayList(fixture.Entry) = .empty;
         defer entries.deinit(a);
         try entries.appendSlice(a, &auxiliary_entries);
-        if (with_stray) try entries.append(a, .{ .name = "model.dfly_layers.stray.weight", .dtype = "BF16", .shape = &.{1}, .bytes = &auxiliary_data });
+        try entries.append(a, .{ .name = stray.name, .dtype = "BF16", .shape = &.{1}, .bytes = &auxiliary_data });
         try fixture.write(a, io, tmp.dir, "model.safetensors", entries.items);
         const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         defer a.free(dir);
         var ck = try core.Checkpoint.openModel(a, io, dir);
         defer ck.close();
         _ = try ck.expect("model.norm.weight", .bf16, &.{1});
-        if (with_stray) {
+        if (stray.refused) {
             try std.testing.expectError(error.UnusedHy4Tensors, loader.finishCuda(&ck, model));
         } else {
             try loader.finishCuda(&ck, model);

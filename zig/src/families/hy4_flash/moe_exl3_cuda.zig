@@ -17,6 +17,9 @@ pub const Route = struct {
     output: u64,
 };
 
+/// The routed kernels' per-pass scratch, shared by every layer: the layers run one at a time on one stream.
+pub const Shared = struct { base: u64 = 0, bytes: usize = 0 };
+
 pub const Routed = struct {
     layer: exl3.Layer,
     scratch: exl3.Scratch,
@@ -29,6 +32,7 @@ pub const Routed = struct {
         rows: usize,
         slots: usize,
         limit: f32,
+        shared: *Shared,
     ) !Routed {
         if (experts.len == 0 or experts.len > 512 or rows == 0 or slots == 0 or slots > 32 or
             rows > 16384 / slots or !std.math.isFinite(limit) or limit <= 0)
@@ -50,11 +54,14 @@ pub const Routed = struct {
         errdefer owner.rollback(mark);
         const layer = try upload.layer(owner, a, latent, intermediate, .mul1, limit, 0, gate, up, down);
         const size = try exl3.scratchBytes(layer, rows, slots);
-        const space = try a.alloc(u8, size);
-        defer a.free(space);
-        @memset(space, 0);
-        const base = try owner.dev(space);
-        return .{ .layer = layer, .scratch = try exl3.scratch(base, layer, rows, slots) };
+        if (shared.base == 0) {
+            const space = try a.alloc(u8, size);
+            defer a.free(space);
+            @memset(space, 0);
+            shared.base = try owner.dev(space);
+            shared.bytes = size;
+        } else if (shared.bytes < size) return error.BadHy4ExpertShape; // one geometry: a wider layer would be a bug
+        return .{ .layer = layer, .scratch = try exl3.scratch(shared.base, layer, rows, slots) };
     }
 
     pub fn forward(

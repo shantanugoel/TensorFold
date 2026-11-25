@@ -11,6 +11,8 @@ const attn = @import("mla_attention.zig");
 const rope = @import("rope.zig");
 const exl3 = @import("moe_exl3_cuda.zig");
 const expert_weights = @import("exl3_weights.zig");
+const dense = @import("dense_weights.zig");
+const load_util = @import("cuda_load_util.zig");
 const engram = @import("engram.zig");
 const engram_cuda = @import("engram_cuda.zig");
 const direct = @import("bf16_rows.zig");
@@ -32,6 +34,7 @@ pub const Kernels = struct {
     attention: mla.Attention,
     ihc: ihc_cuda.Kernels,
     experts: cuda.exl3_experts.Experts,
+    dense: cuda.exl3.Dense,
     act: cuda.act_rows.ActRows,
     glue: cuda.moe_glue.MoeGlue,
     router: cuda.route_rows.RouteRows,
@@ -46,6 +49,7 @@ pub const Kernels = struct {
             .attention = try mla.Attention.load(d),
             .ihc = try ihc_cuda.Kernels.load(d),
             .experts = try cuda.exl3_experts.Experts.load(d),
+            .dense = try cuda.exl3.Dense.load(d),
             .act = try cuda.act_rows.ActRows.load(d),
             .glue = try cuda.moe_glue.MoeGlue.load(d),
             .router = try cuda.route_rows.RouteRows.load(d),
@@ -63,25 +67,25 @@ const Attention = struct {
     input_norm: u64,
     q_a: u64,
     q_norm: u64,
-    q_b: u64,
+    q_b: dense.Projection,
     kv_a: u64,
     kv_norm: u64,
     key: u64,
     value: u64,
-    gate: u64,
-    output: u64,
+    gate: dense.Projection,
+    output: dense.Projection,
     output_norm: u64,
     sinks: u64,
     cache: cuda.DeviceBuffer,
 };
 
-const Dense = struct { gate: u64, up: u64, down: u64 };
+const Dense = struct { gate: dense.Projection, up: dense.Projection, down: dense.Projection };
 const Sparse = struct {
     latent_in: u64,
     latent_out: u64,
-    shared_gate: u64,
-    shared_up: u64,
-    shared_down: u64,
+    shared_gate: dense.Projection,
+    shared_up: dense.Projection,
+    shared_down: dense.Projection,
     router: u64,
     router_bias: u64,
     routed: exl3.Routed,
@@ -157,11 +161,12 @@ pub const Model = struct {
     embed: u64,
     head_hc: Hc,
     final_norm: u64,
-    lm_head: u64,
+    lm_head: dense.Projection,
     scratch: Scratch,
     max_rows: usize,
     capacity: usize,
     history: std.ArrayList(u32) = .empty,
+    expert_scratch: exl3.Shared = .{},
     weight_bytes: usize = 0,
 
     fn tensor(ck: *core.Checkpoint, name: []const u8, dtype: anytype, shape: []const usize) ![]const u8 {
@@ -221,13 +226,13 @@ pub const Model = struct {
             .scale = try self.up(ck, "model.hc_head.hc_head_scale", .{}, .f32, &.{1}),
         };
         self.final_norm = try self.up(ck, "model.norm.weight", .{}, .bf16, &.{H});
-        self.lm_head = try self.up(ck, "lm_head.weight", .{}, .bf16, &.{ V, H });
+        self.lm_head = try dense.read(&self.own, ck, "lm_head", .{}, V, H, .bf16);
         ck.release();
         // UMA guard: device memory is not charged to the cgroup, so stop before the system runs dry.
         const floor_gib = try @import("sys").environment.read(usize, "TF_HY4_MEM_FLOOR_GIB", 10);
         for (self.layers, 0..) |*layer, i| {
-            const avail = memAvailable();
-            std.debug.print("layer {d:>2}: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ i, gib(self.own.bytes), gib(avail) });
+            const avail = load_util.memAvailable();
+            std.debug.print("layer {d:>2}: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ i, load_util.gib(self.own.bytes), load_util.gib(avail) });
             if (avail < floor_gib << 30) {
                 std.debug.print("stopping: MemAvailable below the {d} GiB floor\n", .{floor_gib});
                 return error.Hy4MemoryFloor;
@@ -238,32 +243,10 @@ pub const Model = struct {
         }
         // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor
         try @import("loader.zig").finishCuda(ck, cfg.value);
-        std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ gib(self.own.bytes), gib(memAvailable()) });
+        std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
         self.weight_bytes = self.own.bytes;
         self.scratch = try self.allocScratch();
         return self;
-    }
-
-    fn gib(bytes: usize) f64 {
-        return @as(f64, @floatFromInt(bytes)) / (1 << 30);
-    }
-
-    /// MemAvailable from /proc/meminfo in bytes (0 when unreadable, which trips the floor).
-    fn memAvailable() usize {
-        var buf: [4096]u8 = undefined;
-        const fd = std.c.open("/proc/meminfo", .{});
-        if (fd < 0) return 0;
-        defer _ = std.c.close(fd);
-        const got = std.c.read(fd, &buf, buf.len);
-        if (got <= 0) return 0;
-        const n: usize = @intCast(got);
-        var it = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
-        while (it.next()) |line| if (std.mem.startsWith(u8, line, "MemAvailable:")) {
-            var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
-            const kb = std.fmt.parseInt(usize, f.next() orelse return 0, 10) catch return 0;
-            return kb * 1024;
-        };
-        return 0;
     }
 
     fn loadLayer(self: *Model, a: std.mem.Allocator, io: std.Io, ck: *core.Checkpoint, dir: []const u8, i: usize) !Layer {
@@ -291,18 +274,18 @@ pub const Model = struct {
             .input_norm = try self.up(ck, p ++ "input_layernorm.weight", .{i}, .bf16, &.{H}),
             .q_a = try self.up(ck, p ++ "self_attn.q_a_proj.weight", .{i}, .bf16, &.{ Q, H }),
             .q_norm = try self.up(ck, p ++ "self_attn.q_a_layernorm.weight", .{i}, .bf16, &.{Q}),
-            .q_b = try self.up(ck, p ++ "self_attn.q_b_proj.weight", .{i}, .bf16, &.{ hh * m.query_stride, Q }),
+            .q_b = try dense.read(&self.own, ck, p ++ "self_attn.q_b_proj", .{i}, hh * m.query_stride, Q, .bf16),
             .kv_a = try self.up(ck, p ++ "self_attn.kv_a_proj_with_mqa.weight", .{i}, .bf16, &.{ m.absorbed_stride, H }),
             .kv_norm = try self.up(ck, p ++ "self_attn.kv_a_layernorm.weight", .{i}, .bf16, &.{m.latent}),
             .key = try self.own.dev(std.mem.sliceAsBytes(split.key)),
             .value = try self.own.dev(std.mem.sliceAsBytes(split.value)),
-            .gate = try self.up(ck, p ++ "self_attn.linear_gate.weight", .{i}, .bf16, &.{ hh * m.value_width, H }),
-            .output = try self.up(ck, p ++ "self_attn.o_proj.weight", .{i}, .bf16, &.{ H, hh * m.value_width }),
+            .gate = try dense.read(&self.own, ck, p ++ "self_attn.linear_gate", .{i}, hh * m.value_width, H, .bf16),
+            .output = try dense.read(&self.own, ck, p ++ "self_attn.o_proj", .{i}, H, hh * m.value_width, .bf16),
             .output_norm = try self.up(ck, p ++ "self_attn.post_proj_norm.weight", .{i}, .bf16, &.{H}),
             .sinks = try self.up(ck, p ++ "self_attn.learnable_sink_param", .{i}, .f32, &.{hh}),
             .cache = cache,
         };
-        const dense = t.mlp_layer_types[i] == .dense;
+        const is_dense = t.mlp_layer_types[i] == .dense;
         const feed: Feed = .{
             .hc = .{
                 .project = try self.up(ck, p ++ "hc_mlp_layer.hc_pre.hc_fn", .{i}, .f32, &.{ 2 * S, S * H }),
@@ -310,14 +293,14 @@ pub const Model = struct {
                 .scale = try self.up(ck, p ++ "hc_mlp_layer.hc_pre.hc_scale", .{i}, .f32, &.{2}),
             },
             .input_norm = try self.up(ck, p ++ "post_attention_layernorm.weight", .{i}, .bf16, &.{H}),
-            .output_norm = if (dense)
+            .output_norm = if (is_dense)
                 try self.up(ck, p ++ "mlp.post_fc2_norm.weight", .{i}, .bf16, &.{H})
             else
                 try self.up(ck, p ++ "mlp.combine_output_norm.weight", .{i}, .bf16, &.{H}),
-            .mlp = if (dense) .{ .dense = .{
-                .gate = try self.up(ck, p ++ "mlp.gate_proj.weight", .{i}, .bf16, &.{ D, H }),
-                .up = try self.up(ck, p ++ "mlp.up_proj.weight", .{i}, .bf16, &.{ D, H }),
-                .down = try self.up(ck, p ++ "mlp.down_proj.weight", .{i}, .bf16, &.{ H, D }),
+            .mlp = if (is_dense) .{ .dense = .{
+                .gate = try dense.read(&self.own, ck, p ++ "mlp.gate_proj", .{i}, D, H, .bf16),
+                .up = try dense.read(&self.own, ck, p ++ "mlp.up_proj", .{i}, D, H, .bf16),
+                .down = try dense.read(&self.own, ck, p ++ "mlp.down_proj", .{i}, H, D, .bf16),
             } } else .{ .sparse = blk: {
                 const experts = try std.heap.page_allocator.alloc(expert_weights.Expert, E);
                 defer std.heap.page_allocator.free(experts);
@@ -325,12 +308,12 @@ pub const Model = struct {
                 break :blk .{
                     .latent_in = try self.up(ck, p ++ "mlp.routed_expert_down_proj.weight", .{i}, .bf16, &.{ L, H }),
                     .latent_out = try self.up(ck, p ++ "mlp.routed_expert_up_proj.weight", .{i}, .bf16, &.{ H, L }),
-                    .shared_gate = try self.up(ck, p ++ "mlp.shared_experts.gate_proj.weight", .{i}, .bf16, &.{ L, H }),
-                    .shared_up = try self.up(ck, p ++ "mlp.shared_experts.up_proj.weight", .{i}, .bf16, &.{ L, H }),
-                    .shared_down = try self.up(ck, p ++ "mlp.shared_experts.down_proj.weight", .{i}, .bf16, &.{ H, L }),
+                    .shared_gate = try dense.read(&self.own, ck, p ++ "mlp.shared_experts.gate_proj", .{i}, L, H, .bf16),
+                    .shared_up = try dense.read(&self.own, ck, p ++ "mlp.shared_experts.up_proj", .{i}, L, H, .bf16),
+                    .shared_down = try dense.read(&self.own, ck, p ++ "mlp.shared_experts.down_proj", .{i}, H, L, .bf16),
                     .router = try self.up(ck, p ++ "mlp.gate.weight", .{i}, .bf16, &.{ E, H }),
                     .router_bias = try self.up(ck, p ++ "mlp.gate.e_score_correction_bias", .{i}, .f32, &.{E}),
-                    .routed = try exl3.Routed.init(&self.own, experts, L, L, self.max_rows, K, t.swiglu_limit),
+                    .routed = try exl3.Routed.init(&self.own, experts, L, L, self.max_rows, K, t.swiglu_limit, &self.expert_scratch),
                 };
             } },
         };
@@ -368,7 +351,7 @@ pub const Model = struct {
             const hash = try engram.Layer.open(t, @intCast(i + 1));
             var tb: [128]u8 = undefined;
             const table_name = try std.fmt.bufPrint(&tb, e ++ "multi_head_embedding.embedding.weight", .{i});
-            const shard = try shardOf(a, io, dir, table_name);
+            const shard = try load_util.shardOf(a, io, dir, table_name);
             // The config's per-layer row count, so a wrong or repacked table fails here and not mid-forward.
             const rows_expected = try t.engramRows(@intCast(i + 1));
             var table = try direct.openDirect(a, shard, table_name, map, hash, rows_expected);
@@ -377,14 +360,6 @@ pub const Model = struct {
             eng = .{ .w = w, .table = table };
         }
         return .{ .engram = eng, .attention = att, .feed = feed };
-    }
-
-    /// The safetensors file holding `name` (the Engram tables sit alone in their shards).
-    fn shardOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![:0]const u8 {
-        const index = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "model.safetensors.index.json" }), a, .limited(1 << 26));
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, index, .{});
-        const file = parsed.object.get("weight_map").?.object.get(name) orelse return error.MissingHy4EngramTable;
-        return std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, file.string }, 0);
     }
 
     fn allocScratch(self: *Model) !Scratch {
@@ -439,8 +414,25 @@ pub const Model = struct {
         return .{ .rows = @intCast(rows), .width = H, .gates = gates, .eps = self.text.rms_norm_eps, .gate_eps = self.text.hc_eps, .post_magnitude = self.text.hc_magnitude };
     }
 
+    /// One projection's rows: the pack's EXL3 group through the dense kernels, or its BF16 weight through cuBLAS.
+    fn project(self: *Model, s: cuda.Stream, p: dense.Projection, x: u64, rows: usize, y: u64, out: cuda.cublaslt.DataType) !void {
+        switch (p.weight) {
+            .bf16 => |w| try self.k.gemm.run(s, x, w, y, rows, p.n, p.k, out),
+            .exl3 => |w| try self.k.dense.prompt(s, w, x, .bf16, rows, y, switch (out) {
+                .f32 => .f32,
+                .f16 => .f16,
+                .bf16 => .bf16,
+            }),
+        }
+    }
+
     /// Run `tokens` (appended at the current history length) through the model; returns the last row's logits.
     pub fn pass(self: *Model, tokens: []const u32, logits_out: []f32) !void {
+        return self.passRows(tokens, logits_out, null);
+    }
+
+    /// `pass`, and every row's logits into `rows_out` ([tokens.len][vocab], FP32) when it is given.
+    pub fn passRows(self: *Model, tokens: []const u32, logits_out: []f32, rows_out: ?[]f32) !void {
         const rows = tokens.len;
         const start = self.history.items.len;
         if (rows == 0 or rows > self.max_rows or start + rows > self.capacity) return error.BadHy4PassRows;
@@ -516,14 +508,13 @@ pub const Model = struct {
             }
             // Attention half.
             const at = &layer.attention;
-            const hh: usize = at.heads;
             try k.ihc.collapse(s, .{ .hidden = x, .projection = at.hc.project, .bias = at.hc.bias, .scale = at.hc.scale, .output = sc.collapsed, .post = sc.post }, self.hcShape(rows, 2 * S));
             try k.norms.addRmsTail(s, sc.collapsed, null, at.input_norm, sc.norm_tmp, sc.hidden, null, rows, H, eps, .{ .round = true });
             try k.gemm.run(s, sc.hidden, at.q_a, sc.q_raw, rows, Q, H, .bf16);
             try k.norms.addRmsTail(s, sc.q_raw, null, at.q_norm, sc.q_tmp, sc.q_resid, null, rows, Q, eps, .{ .round = true });
-            try k.gemm.run(s, sc.q_resid, at.q_b, sc.q, rows, hh * m.query_stride, Q, .bf16);
+            try self.project(s, at.q_b, sc.q_resid, rows, sc.q, .bf16);
             try k.gemm.run(s, sc.hidden, at.kv_a, sc.kv, rows, m.absorbed_stride, H, .bf16);
-            try k.gemm.run(s, sc.hidden, at.gate, sc.gate, rows, hh * m.value_width, H, .bf16);
+            try self.project(s, at.gate, sc.hidden, rows, sc.gate, .bf16);
             const stride: usize = if (at.sliding) sliding_stride else sparse_stride;
             try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(if (at.sliding) keys_sliding else keys_sparse), s.handle);
             try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(if (at.sliding) counts_sliding else counts_sparse), s.handle);
@@ -548,7 +539,7 @@ pub const Model = struct {
                 },
                 .values = sc.values,
             }, shape, try self.text.rotary(if (at.sliding) .sliding_attention else .deepseek_sparse_attention));
-            try k.gemm.run(s, sc.values, at.output, sc.branch, rows, H, hh * m.value_width, .bf16);
+            try self.project(s, at.output, sc.values, rows, sc.branch, .bf16);
             try k.norms.addRmsTail(s, sc.branch, null, at.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
             const after_attn = sc.streams[(slot + 1) % 3].ptr;
             try k.ihc.add(s, .{ .residual = x, .branch = sc.branch_norm, .post = sc.post, .output = after_attn }, self.hcShape(rows, 2 * S));
@@ -560,10 +551,10 @@ pub const Model = struct {
             try k.norms.addRmsTail(s, sc.collapsed, null, f.input_norm, sc.norm_tmp, sc.hidden, null, rows, H, eps, .{ .round = true });
             switch (f.mlp) {
                 .dense => |dn| {
-                    try k.gemm.run(s, sc.hidden, dn.gate, sc.ff_gate, rows, D, H, .bf16);
-                    try k.gemm.run(s, sc.hidden, dn.up, sc.ff_up, rows, D, H, .bf16);
+                    try self.project(s, dn.gate, sc.hidden, rows, sc.ff_gate, .bf16);
+                    try self.project(s, dn.up, sc.hidden, rows, sc.ff_up, .bf16);
                     try k.act.swiglu(s, sc.ff_gate, D, sc.ff_up, D, sc.ff_inner, null, rows, D);
-                    try k.gemm.run(s, sc.ff_inner, dn.down, sc.shared, rows, H, D, .bf16);
+                    try self.project(s, dn.down, sc.ff_inner, rows, sc.shared, .bf16);
                     try k.norms.addRmsTail(s, sc.shared, null, f.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
                 },
                 .sparse => |sp| {
@@ -573,10 +564,10 @@ pub const Model = struct {
                     const y = try sp.routed.run(&k.experts, s, sc.latent, sc.picks, rows);
                     try k.glue.combine(s, y, .f32, sc.probabilities, sc.mix, .bf16, rows, K, L);
                     try k.gemm.run(s, sc.mix, sp.latent_out, sc.route_out, rows, H, L, .bf16);
-                    try k.gemm.run(s, sc.hidden, sp.shared_gate, sc.ff_gate, rows, L, H, .bf16);
-                    try k.gemm.run(s, sc.hidden, sp.shared_up, sc.ff_up, rows, L, H, .bf16);
+                    try self.project(s, sp.shared_gate, sc.hidden, rows, sc.ff_gate, .bf16);
+                    try self.project(s, sp.shared_up, sc.hidden, rows, sc.ff_up, .bf16);
                     try k.act.swiglu(s, sc.ff_gate, L, sc.ff_up, L, sc.ff_inner, null, rows, L);
-                    try k.gemm.run(s, sc.ff_inner, sp.shared_down, sc.shared, rows, H, L, .bf16);
+                    try self.project(s, sp.shared_down, sc.ff_inner, rows, sc.shared, .bf16);
                     try k.norms.addRmsTail(s, sc.route_out, sc.shared, f.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
                 },
             }
@@ -585,12 +576,23 @@ pub const Model = struct {
             slot = (slot + 1) % 3;
             x = after_ff;
         }
-        // Hyper head, final norm and LM head on the last row.
-        const last = x + (rows - 1) * S * H * 2;
-        try k.ihc.collapse(s, .{ .hidden = last, .projection = self.head_hc.project, .bias = self.head_hc.bias, .scale = self.head_hc.scale, .output = sc.head_hidden, .post = 0 }, self.hcShape(1, S));
-        try k.norms.addRmsTail(s, sc.head_hidden, null, self.final_norm, sc.norm_tmp, sc.head_norm, null, 1, H, eps, .{ .round = true });
-        try k.gemm.run(s, sc.head_norm, self.lm_head, sc.lm_logits, 1, self.text.vocab_size, H, .f32);
+        // Hyper head, final norm and LM head: the last row alone, and every row when a scoring pass asks.
+        if (rows_out) |all| {
+            if (all.len != rows * self.text.vocab_size) return error.BadHy4PassRows;
+            for (0..rows) |r| try self.headRow(s, x, r, all[r * self.text.vocab_size ..][0..self.text.vocab_size]);
+        }
+        try self.headRow(s, x, rows - 1, logits_out);
+    }
+
+    /// Row `row` of the pass's final streams through the hyper head, final norm and LM head, down to `out`.
+    fn headRow(self: *Model, s: cuda.Stream, x: u64, row: usize, out: []f32) !void {
+        const sc = self.scratch;
+        const k = self.k;
+        const hidden = x + row * S * H * 2;
+        try k.ihc.collapse(s, .{ .hidden = hidden, .projection = self.head_hc.project, .bias = self.head_hc.bias, .scale = self.head_hc.scale, .output = sc.head_hidden, .post = 0 }, self.hcShape(1, S));
+        try k.norms.addRmsTail(s, sc.head_hidden, null, self.final_norm, sc.norm_tmp, sc.head_norm, null, 1, H, self.text.rms_norm_eps, .{ .round = true });
+        try self.project(s, self.lm_head, sc.head_norm, 1, sc.lm_logits, .f32);
         try s.synchronize();
-        try cuda.memory.download(self.d, sc.lm_logits, std.mem.sliceAsBytes(logits_out));
+        try cuda.memory.download(self.d, sc.lm_logits, std.mem.sliceAsBytes(out));
     }
 };
