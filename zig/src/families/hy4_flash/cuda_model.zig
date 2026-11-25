@@ -204,6 +204,9 @@ pub const Model = struct {
         self.weight_bytes = self.own.bytes;
         self.scratch = try geom.alloc(self.d, &self.own, self.max_rows, self.text.vocab_size);
         self.index = try cuda_index.Scratch.init(self.d, self.max_rows, self.capacity);
+        // The two pieces that grow with the context, so a size decision is read and not inferred.
+        const kv_bytes = self.capacity * m.absorbed_stride * 2 * self.layers.len;
+        std.debug.print("capacity {d}: KV {d:.2} GiB, recall scores {d:.0} MiB\n", .{ self.capacity, load_util.gib(kv_bytes), @as(f64, @floatFromInt(self.index.scoreBytes())) / (1 << 20) });
         return self;
     }
 
