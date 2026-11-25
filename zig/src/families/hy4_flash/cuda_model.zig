@@ -16,16 +16,19 @@ const load_util = @import("cuda_load_util.zig");
 const engram = @import("engram.zig");
 const engram_cuda = @import("engram_cuda.zig");
 const direct = @import("bf16_rows.zig");
+const geom = @import("cuda_scratch.zig");
+const cuda_index = @import("cuda_index.zig");
 
-const H = 3072;
-const S = ihc.streams;
-const L = 1536;
-const D = 13824;
-const E = 512;
-const K = 16;
-const Q = 1024;
-const sparse_stride = 2048;
-const sliding_stride = 512;
+const H = geom.H;
+const S = geom.S;
+const L = geom.L;
+const D = geom.D;
+const E = geom.E;
+const K = geom.K;
+const Q = geom.Q;
+const sparse_stride = geom.sparse_stride;
+const sliding_stride = geom.sliding_stride;
+const Scratch = geom.Scratch;
 
 pub const Kernels = struct {
     gemm: cuda.vit.Gemms,
@@ -39,6 +42,7 @@ pub const Kernels = struct {
     glue: cuda.moe_glue.MoeGlue,
     router: cuda.route_rows.RouteRows,
     engram: engram_cuda.Kernels,
+    indexer: cuda_index.Kernels,
 
     /// The kernel images embedded in this build (`-Dnvcc` or `-Dprebuilt`).
     pub fn load(a: std.mem.Allocator, d: *const cuda.Driver) !Kernels {
@@ -54,6 +58,7 @@ pub const Kernels = struct {
             .glue = try cuda.moe_glue.MoeGlue.load(d),
             .router = try cuda.route_rows.RouteRows.load(d),
             .engram = try engram_cuda.Kernels.load(d),
+            .indexer = try cuda_index.Kernels.load(d),
         };
     }
 };
@@ -77,6 +82,7 @@ const Attention = struct {
     output_norm: u64,
     sinks: u64,
     cache: cuda.DeviceBuffer,
+    index: ?*cuda_index.Layer = null,
 };
 
 const Dense = struct { gate: dense.Projection, up: dense.Projection, down: dense.Projection };
@@ -105,51 +111,6 @@ const Engram = struct {
 
 const Layer = struct { engram: ?Engram, attention: Attention, feed: Feed };
 
-/// Per-pass device scratch sized for `max_rows`.
-const Scratch = struct {
-    streams: [3]cuda.DeviceBuffer, // [rows, 4, H], rotated through the layer halves
-    collapsed: u64,
-    post: u64,
-    hidden: u64,
-    norm_tmp: u64,
-    q_raw: u64,
-    q_tmp: u64,
-    q_resid: u64,
-    q: u64,
-    kv: u64,
-    gate: u64,
-    absorb: u64,
-    latent_out: u64,
-    values: u64,
-    branch: u64,
-    branch_norm: u64,
-    attn_scratch: u64,
-    attn_scratch_bytes: usize,
-    positions: cuda.DeviceBuffer,
-    table: u64,
-    slots: cuda.DeviceBuffer,
-    counts: cuda.DeviceBuffer,
-    write_slots: cuda.DeviceBuffer,
-    media: u64,
-    latent: u64,
-    logits: u64,
-    picks: u64,
-    probabilities: u64,
-    mix: u64,
-    route_out: u64,
-    ff_gate: u64,
-    ff_up: u64,
-    ff_inner: u64,
-    shared: u64,
-    e_raw: cuda.DeviceBuffer,
-    e_normalized: u64,
-    e_keys: u64,
-    e_value: u64,
-    head_hidden: u64,
-    head_norm: u64,
-    lm_logits: u64,
-};
-
 pub const Model = struct {
     a: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -163,6 +124,7 @@ pub const Model = struct {
     final_norm: u64,
     lm_head: dense.Projection,
     scratch: Scratch,
+    index: cuda_index.Scratch,
     max_rows: usize,
     capacity: usize,
     history: std.ArrayList(u32) = .empty,
@@ -184,20 +146,14 @@ pub const Model = struct {
         return self.own.dev(try tensor(ck, name, dtype, shape));
     }
 
-    fn zeros(self: *Model, bytes: usize) !u64 {
-        const z = try std.heap.page_allocator.alloc(u8, bytes);
-        defer std.heap.page_allocator.free(z);
-        @memset(z, 0);
-        return self.own.dev(z);
-    }
-
     pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *Kernels, dir: []const u8, capacity: usize, max_rows: usize) !*Model {
         const cfg = try config.parse(a, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 20)));
         const t = cfg.value.text_config;
         if (t.hidden_size != H or t.hc_mult != S or t.routed_expert_hidden_size != L or t.moe_intermediate_size != L or
             t.intermediate_size != D or t.n_routed_experts != E or t.num_experts_per_tok != K or t.q_lora_rank != Q)
             return error.BadHy4ModelShape;
-        if (capacity > sparse_stride or max_rows == 0 or max_rows > 1024) return error.BadHy4RunnerCapacity;
+        // Past the 2,048-key budget an indexed row attends recall lists, so capacity is free up to the scores' width.
+        if (capacity == 0 or capacity > cuda_index.max_capacity or max_rows == 0 or max_rows > geom.row_cap) return error.BadHy4RunnerCapacity;
         const ck = try a.create(core.Checkpoint);
         ck.* = try core.Checkpoint.openModel(a, io, dir);
         const self = try a.create(Model);
@@ -215,6 +171,7 @@ pub const Model = struct {
             .final_norm = undefined,
             .lm_head = undefined,
             .scratch = undefined,
+            .index = undefined,
             .max_rows = max_rows,
             .capacity = capacity,
         };
@@ -245,7 +202,8 @@ pub const Model = struct {
         try @import("loader.zig").finishCuda(ck, cfg.value);
         std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
         self.weight_bytes = self.own.bytes;
-        self.scratch = try self.allocScratch();
+        self.scratch = try geom.alloc(self.d, &self.own, self.max_rows, self.text.vocab_size);
+        self.index = try cuda_index.Scratch.init(self.d, self.max_rows, self.capacity);
         return self;
     }
 
@@ -284,6 +242,8 @@ pub const Model = struct {
             .output_norm = try self.up(ck, p ++ "self_attn.post_proj_norm.weight", .{i}, .bf16, &.{H}),
             .sinks = try self.up(ck, p ++ "self_attn.learnable_sink_param", .{i}, .f32, &.{hh}),
             .cache = cache,
+            // Below the key budget nothing selects, so a short context carries no indexer state at all.
+            .index = if (sliding or self.capacity <= sparse_stride) null else try cuda_index.Layer.load(a, self.d, &self.own, ck, i, t, self.capacity),
         };
         const is_dense = t.mlp_layer_types[i] == .dense;
         const feed: Feed = .{
@@ -362,54 +322,6 @@ pub const Model = struct {
         return .{ .engram = eng, .attention = att, .feed = feed };
     }
 
-    fn allocScratch(self: *Model) !Scratch {
-        const r = self.max_rows;
-        const shape = try attn.Shape.init(@intCast(r), 64, sparse_stride);
-        var sc: Scratch = undefined;
-        for (&sc.streams) |*x| x.* = try cuda.DeviceBuffer.alloc(self.d, r * S * H * 2);
-        sc.collapsed = try self.zeros(r * H * 2);
-        sc.post = try self.zeros(r * S * 4);
-        sc.hidden = try self.zeros(r * H * 2);
-        sc.norm_tmp = try self.zeros(r * D * 2);
-        sc.q_raw = try self.zeros(r * Q * 2);
-        sc.q_tmp = try self.zeros(r * Q * 2);
-        sc.q_resid = try self.zeros(r * Q * 2);
-        sc.q = try self.zeros(r * 64 * m.query_stride * 2);
-        sc.kv = try self.zeros(r * m.absorbed_stride * 2);
-        sc.gate = try self.zeros(r * 64 * m.value_width * 2);
-        sc.absorb = try self.zeros(r * 64 * m.absorbed_stride * 2);
-        sc.latent_out = try self.zeros(r * 64 * m.latent * 2);
-        sc.values = try self.zeros(r * 64 * m.value_width * 2);
-        sc.branch = try self.zeros(r * H * 2);
-        sc.branch_norm = try self.zeros(r * H * 2);
-        sc.attn_scratch_bytes = shape.scratchBytes();
-        sc.attn_scratch = try self.zeros(sc.attn_scratch_bytes);
-        sc.positions = try cuda.DeviceBuffer.alloc(self.d, r * 12);
-        sc.table = try self.zeros(r * 64 * 2);
-        sc.slots = try cuda.DeviceBuffer.alloc(self.d, r * sparse_stride * 4);
-        sc.counts = try cuda.DeviceBuffer.alloc(self.d, r * 4);
-        sc.write_slots = try cuda.DeviceBuffer.alloc(self.d, r * 4);
-        sc.media = try self.zeros(r * 4);
-        sc.latent = try self.zeros(r * L * 2);
-        sc.logits = try self.zeros(r * E * 4);
-        sc.picks = try self.zeros(r * K * 4);
-        sc.probabilities = try self.zeros(r * K * 4);
-        sc.mix = try self.zeros(r * L * 2);
-        sc.route_out = try self.zeros(r * H * 2);
-        sc.ff_gate = try self.zeros(r * D * 2);
-        sc.ff_up = try self.zeros(r * D * 2);
-        sc.ff_inner = try self.zeros(r * D * 2);
-        sc.shared = try self.zeros(r * H * 2);
-        sc.e_raw = try cuda.DeviceBuffer.alloc(self.d, r * engram_cuda.input * 2);
-        sc.e_normalized = try self.zeros(r * engram_cuda.input * 2);
-        sc.e_keys = try self.zeros(S * r * H * 2);
-        sc.e_value = try self.zeros(r * H * 2);
-        sc.head_hidden = try self.zeros(r * H * 2);
-        sc.head_norm = try self.zeros(r * H * 2);
-        sc.lm_logits = try self.zeros(@as(usize, self.text.vocab_size) * 4);
-        return sc;
-    }
-
     fn hcShape(self: *const Model, rows: usize, gates: u32) ihc.Shape {
         return .{ .rows = @intCast(rows), .width = H, .gates = gates, .eps = self.text.rms_norm_eps, .gate_eps = self.text.hc_eps, .post_magnitude = self.text.hc_magnitude };
     }
@@ -426,13 +338,16 @@ pub const Model = struct {
         }
     }
 
+    /// Which pass rows to hand back: `out` holds one `vocab`-wide FP32 row a pass row from `at` on.
+    pub const Rows = struct { at: usize, out: []f32 };
+
     /// Run `tokens` (appended at the current history length) through the model; returns the last row's logits.
     pub fn pass(self: *Model, tokens: []const u32, logits_out: []f32) !void {
         return self.passRows(tokens, logits_out, null);
     }
 
-    /// `pass`, and every row's logits into `rows_out` ([tokens.len][vocab], FP32) when it is given.
-    pub fn passRows(self: *Model, tokens: []const u32, logits_out: []f32, rows_out: ?[]f32) !void {
+    /// `pass`, and the rows `rows_out` names into it, as one `vocab`-wide FP32 row each.
+    pub fn passRows(self: *Model, tokens: []const u32, logits_out: []f32, rows_out: ?Rows) !void {
         const rows = tokens.len;
         const start = self.history.items.len;
         if (rows == 0 or rows > self.max_rows or start + rows > self.capacity) return error.BadHy4PassRows;
@@ -458,7 +373,9 @@ pub const Model = struct {
         }
         try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(positions), s.handle);
         try sc.write_slots.uploadAsync(0, std.mem.sliceAsBytes(writes), s.handle);
-        const keys_sparse = try self.a.alloc(u32, rows * sparse_stride);
+        // Past the budget an indexed row's list comes from the layer's indexer, so nothing is built here.
+        const lists = self.capacity > sparse_stride and start + rows - 1 >= sparse_stride;
+        const keys_sparse = try self.a.alloc(u32, if (lists) 0 else rows * sparse_stride);
         defer self.a.free(keys_sparse);
         const keys_sliding = try self.a.alloc(u32, rows * sliding_stride);
         defer self.a.free(keys_sliding);
@@ -470,8 +387,10 @@ pub const Model = struct {
         @memset(keys_sliding, 0);
         for (0..rows) |r| {
             const pos = start + r;
-            counts_sparse[r] = @intCast(pos + 1);
-            for (0..pos + 1) |j| keys_sparse[r * sparse_stride + j] = @intCast(j);
+            if (!lists) {
+                counts_sparse[r] = @intCast(pos + 1);
+                for (0..pos + 1) |j| keys_sparse[r * sparse_stride + j] = @intCast(j);
+            }
             const first = if (pos + 1 > sliding_stride) pos + 1 - sliding_stride else 0;
             counts_sliding[r] = @intCast(pos + 1 - first);
             for (first..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(j);
@@ -487,6 +406,7 @@ pub const Model = struct {
         const raw_rows = try self.a.alloc(u16, rows * engram_cuda.input);
         defer self.a.free(raw_rows);
 
+        const rope_sparse = try self.text.rotary(.deepseek_sparse_attention);
         var slot: usize = 0; // index of the stream buffer x lives in
         for (self.layers) |*layer| {
             // Engram residual into the streams.
@@ -516,8 +436,20 @@ pub const Model = struct {
             try k.gemm.run(s, sc.hidden, at.kv_a, sc.kv, rows, m.absorbed_stride, H, .bf16);
             try self.project(s, at.gate, sc.hidden, rows, sc.gate, .bf16);
             const stride: usize = if (at.sliding) sliding_stride else sparse_stride;
-            try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(if (at.sliding) keys_sliding else keys_sparse), s.handle);
-            try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(if (at.sliding) counts_sliding else counts_sparse), s.handle);
+            if (at.index) |ix| try cuda_index.forward(.{
+                .s = s, .indexer = &k.indexer, .gemms = &k.gemm, .norms = &k.norms, .project = k.project,
+                .scratch = &self.index, .layer = ix, .hidden = sc.hidden, .q_resid = sc.q_resid,
+                .write_slots = sc.write_slots.ptr, .positions = sc.positions.ptr, .table = sc.table,
+                .slots = sc.slots.ptr, .counts = sc.counts.ptr, .first = start, .rows = rows, .select = lists,
+                .epsilon = eps, .rope = rope_sparse, .q_rank = Q, .hidden_size = H,
+            });
+            if (at.sliding) {
+                try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(keys_sliding), s.handle);
+                try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(counts_sliding), s.handle);
+            } else if (!lists) {
+                try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(keys_sparse), s.handle);
+                try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(counts_sparse), s.handle);
+            }
             const shape = try attn.Shape.init(@intCast(rows), at.heads, @intCast(stride));
             try mla.forward(k.project, k.attention, s, .{
                 .query = sc.q,
@@ -538,7 +470,7 @@ pub const Model = struct {
                     .output = sc.latent_out,
                 },
                 .values = sc.values,
-            }, shape, try self.text.rotary(if (at.sliding) .sliding_attention else .deepseek_sparse_attention));
+            }, shape, if (at.sliding) try self.text.rotary(.sliding_attention) else rope_sparse);
             try self.project(s, at.output, sc.values, rows, sc.branch, .bf16);
             try k.norms.addRmsTail(s, sc.branch, null, at.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
             const after_attn = sc.streams[(slot + 1) % 3].ptr;
@@ -577,9 +509,11 @@ pub const Model = struct {
             x = after_ff;
         }
         // Hyper head, final norm and LM head: the last row alone, and every row when a scoring pass asks.
-        if (rows_out) |all| {
-            if (all.len != rows * self.text.vocab_size) return error.BadHy4PassRows;
-            for (0..rows) |r| try self.headRow(s, x, r, all[r * self.text.vocab_size ..][0..self.text.vocab_size]);
+        if (rows_out) |want| {
+            const V: usize = self.text.vocab_size;
+            const count = want.out.len / V;
+            if (want.out.len != count * V or want.at + count > rows) return error.BadHy4PassRows;
+            for (0..count) |r| try self.headRow(s, x, want.at + r, want.out[r * V ..][0..V]);
         }
         try self.headRow(s, x, rows - 1, logits_out);
     }
