@@ -3,10 +3,11 @@ const std = @import("std");
 const cuda = @import("cuda");
 const model = @import("cuda_model.zig");
 
-const usage = "usage: tf-hy4-cuda-generate MODEL_DIR PROMPT_IDS.u32 NEW_TOKENS OUT_DIR [CHUNK] [--score] [--logits-last N]\n" ++
+const usage = "usage: tf-hy4-cuda-generate MODEL_DIR PROMPT_IDS.u32 NEW_TOKENS OUT_DIR [CHUNK] [--score] [--logits-last N] [--no-ring]\n" ++
     "  CHUNK            rows a pass takes, at most 1024 (default 1024)\n" ++
     "  --score          also write logits.f32 (every row but the last), scores.f32 and report.json\n" ++
-    "  --logits-last N  with --score: keep only the last N of those rows, as exl3_reference.py does\n";
+    "  --logits-last N  with --score: keep only the last N of those rows, as exl3_reference.py does\n" ++
+    "  --no-ring        keep the sliding layers' full-length KV: the arm the ring is gated against\n";
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -19,10 +20,13 @@ pub fn main(init: std.process.Init) !void {
     var chunk: usize = 1024;
     var score = false;
     var last: usize = 0;
+    var ring = true;
     var i: usize = 5;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--score")) {
             score = true;
+        } else if (std.mem.eql(u8, args[i], "--no-ring")) {
+            ring = false;
         } else if (std.mem.eql(u8, args[i], "--logits-last")) {
             if (i + 1 == args.len) return error.BadArgs;
             i += 1;
@@ -48,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     const t0 = std.Io.Clock.awake.now(io);
     const capacity = prompt.len + new_tokens;
     const max_rows = @min(chunk, prompt.len);
-    const hy4 = try model.Model.open(a, io, &driver, s, &kernels, args[1], capacity, @max(max_rows, 1));
+    const hy4 = try model.Model.open(a, io, &driver, s, &kernels, args[1], .{ .capacity = capacity, .max_rows = max_rows, .ring = ring });
     const load_ns = t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     std.debug.print("loaded {d} layers, {d:.2} GiB device weights in {d:.1} s\n", .{ hy4.layers.len, @as(f64, @floatFromInt(hy4.weight_bytes)) / (1 << 30), @as(f64, @floatFromInt(load_ns)) / 1e9 });
     const V: usize = hy4.text.vocab_size;
@@ -83,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const prefill_ns = p0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     try out.writeFile(io, .{ .sub_path = "prefill-logits.f32", .data = std.mem.sliceAsBytes(logits) });
-    if (pass_logits != null) try writeScores(io, a, out, tail[0 .. keep * V], scores.items, prompt.len, keep, chunk, prefill_ns);
+    if (pass_logits != null) try writeScores(io, a, out, tail[0 .. keep * V], scores.items, prompt.len, keep, chunk, ring, prefill_ns);
     const d0 = std.Io.Clock.awake.now(io);
     var copy: std.ArrayList(u32) = .empty;
     for (0..new_tokens) |step| {
@@ -123,15 +127,15 @@ fn appendScores(scores: *std.ArrayList(f32), rows: []const f32, tokens: []const 
 }
 
 /// `exl3_reference.py --score --save-logits`'s layout: logits.f32 for the kept rows, every scored row's log-prob.
-fn writeScores(io: std.Io, a: std.mem.Allocator, out: std.Io.Dir, tail: []const f32, scores: []const f32, prompt_tokens: usize, keep: usize, chunk: usize, prefill_ns: i96) !void {
+fn writeScores(io: std.Io, a: std.mem.Allocator, out: std.Io.Dir, tail: []const f32, scores: []const f32, prompt_tokens: usize, keep: usize, chunk: usize, ring: bool, prefill_ns: i96) !void {
     try out.writeFile(io, .{ .sub_path = "logits.f32", .data = std.mem.sliceAsBytes(tail) });
     try out.writeFile(io, .{ .sub_path = "scores.f32", .data = std.mem.sliceAsBytes(scores) });
     var nll: f64 = 0;
     for (scores) |s| nll -= @as(f64, s);
     const rows = scores.len;
     const per = @as(f64, @floatFromInt(@max(rows, 1))); // a one-token prompt scores nothing
-    const report = try std.fmt.allocPrint(a, "{{\"prompt_tokens\": {d}, \"scored\": {d}, \"logits_rows\": {d}, \"nll\": {d}, \"ppl\": {d}, \"chunk\": {d}, \"prefill_s\": {d}}}\n", .{
-        prompt_tokens, rows, keep, nll / per, @exp(nll / per), chunk, @as(f64, @floatFromInt(prefill_ns)) / 1e9,
+    const report = try std.fmt.allocPrint(a, "{{\"prompt_tokens\": {d}, \"scored\": {d}, \"logits_rows\": {d}, \"nll\": {d}, \"ppl\": {d}, \"chunk\": {d}, \"ring\": {s}, \"prefill_s\": {d}}}\n", .{
+        prompt_tokens, rows, keep, nll / per, @exp(nll / per), chunk, if (ring) "true" else "false", @as(f64, @floatFromInt(prefill_ns)) / 1e9,
     });
     try out.writeFile(io, .{ .sub_path = "report.json", .data = report });
     std.debug.print("scored {d} rows, kept {d}: nll {d:.4} ppl {d:.4}\n", .{ rows, keep, nll / per, @exp(nll / per) });

@@ -81,7 +81,8 @@ const Attention = struct {
     output: dense.Projection,
     output_norm: u64,
     sinks: u64,
-    cache: cuda.DeviceBuffer,
+    cache: cuda.DeviceBuffer, // a sliding layer's ring rows, or the context's rows behind an indexed layer
+    rows: u32, // `cache`'s rows: the bound the write kernel refuses a slot past
     index: ?*cuda_index.Layer = null,
 };
 
@@ -127,6 +128,8 @@ pub const Model = struct {
     index: cuda_index.Scratch,
     max_rows: usize,
     capacity: usize,
+    /// The sliding layers' KV as `geom.ring.rows` slots; false is the full-length arm the ring is gated against.
+    ring: bool,
     history: std.ArrayList(u32) = .empty,
     expert_scratch: exl3.Shared = .{},
     weight_bytes: usize = 0,
@@ -146,7 +149,16 @@ pub const Model = struct {
         return self.own.dev(try tensor(ck, name, dtype, shape));
     }
 
-    pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *Kernels, dir: []const u8, capacity: usize, max_rows: usize) !*Model {
+    /// What one load takes: the context's rows, the widest pass, and whether sliding layers keep a ring.
+    pub const Options = struct {
+        capacity: usize,
+        max_rows: usize,
+        ring: bool = true,
+    };
+
+    pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *Kernels, dir: []const u8, o: Options) !*Model {
+        const capacity = o.capacity;
+        const max_rows = o.max_rows;
         const cfg = try config.parse(a, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 20)));
         const t = cfg.value.text_config;
         if (t.hidden_size != H or t.hc_mult != S or t.routed_expert_hidden_size != L or t.moe_intermediate_size != L or
@@ -154,6 +166,7 @@ pub const Model = struct {
             return error.BadHy4ModelShape;
         // Past the 2,048-key budget an indexed row attends recall lists, so capacity is free up to the scores' width.
         if (capacity == 0 or capacity > cuda_index.max_capacity or max_rows == 0 or max_rows > geom.row_cap) return error.BadHy4RunnerCapacity;
+        if (o.ring) try geom.ring.check(max_rows);
         const ck = try a.create(core.Checkpoint);
         ck.* = try core.Checkpoint.openModel(a, io, dir);
         const self = try a.create(Model);
@@ -174,6 +187,7 @@ pub const Model = struct {
             .index = undefined,
             .max_rows = max_rows,
             .capacity = capacity,
+            .ring = o.ring,
         };
         const V: usize = t.vocab_size;
         self.embed = try self.up(ck, "model.embed_tokens.weight", .{}, .bf16, &.{ V, H });
@@ -204,10 +218,46 @@ pub const Model = struct {
         self.weight_bytes = self.own.bytes;
         self.scratch = try geom.alloc(self.d, &self.own, self.max_rows, self.text.vocab_size);
         self.index = try cuda_index.Scratch.init(self.d, self.max_rows, self.capacity);
-        // The two pieces that grow with the context, so a size decision is read and not inferred.
-        const kv_bytes = self.capacity * m.absorbed_stride * 2 * self.layers.len;
-        std.debug.print("capacity {d}: KV {d:.2} GiB, recall scores {d:.0} MiB\n", .{ self.capacity, load_util.gib(kv_bytes), @as(f64, @floatFromInt(self.index.scoreBytes())) / (1 << 20) });
+        try self.reserveDense();
+        // The pieces that grow with the context, so a size decision is read and not inferred.
+        var kv_bytes: usize = 0;
+        var sliding: usize = 0;
+        for (self.layers) |layer| {
+            kv_bytes += @as(usize, layer.attention.rows) * m.absorbed_stride * 2;
+            sliding += @intFromBool(layer.attention.sliding);
+        }
+        std.debug.print("capacity {d}: KV {d:.2} GiB ({d} B a token over {d} indexed layers, {d} sliding at {d} rows), recall scores {d:.0} MiB\n", .{
+            self.capacity,
+            load_util.gib(kv_bytes),
+            (self.layers.len - sliding) * m.absorbed_stride * 2,
+            self.layers.len - sliding,
+            sliding,
+            if (self.ring) geom.ring.rows else self.capacity,
+            @as(f64, @floatFromInt(self.index.scoreBytes())) / (1 << 20),
+        });
         return self;
+    }
+
+    /// The shared EXL3 scratch at its widest, inside the load's memory accounting instead of the first forward's.
+    fn reserveDense(self: *Model) !void {
+        for (self.layers) |layer| {
+            const att = [3]dense.Projection{ layer.attention.q_b, layer.attention.gate, layer.attention.output };
+            const feed = switch (layer.feed.mlp) {
+                .dense => |dn| [3]dense.Projection{ dn.gate, dn.up, dn.down },
+                .sparse => |sp| [3]dense.Projection{ sp.shared_gate, sp.shared_up, sp.shared_down },
+            };
+            for (att ++ feed) |p| switch (p.weight) {
+                .bf16 => {},
+                .exl3 => |w| try self.k.dense.reserve(self.s, w),
+            };
+        }
+        switch (self.lm_head.weight) {
+            .bf16 => {},
+            .exl3 => |w| try self.k.dense.reserve(self.s, w),
+        }
+        var bytes: usize = 0;
+        for ([_]?cuda.DeviceBuffer{ self.k.dense.xh, self.k.dense.z, self.k.dense.counters }) |slot| bytes += if (slot) |b| b.len else 0;
+        std.debug.print("EXL3 dense scratch {d:.1} MiB\n", .{@as(f64, @floatFromInt(bytes)) / (1 << 20)});
     }
 
     fn loadLayer(self: *Model, a: std.mem.Allocator, io: std.Io, ck: *core.Checkpoint, dir: []const u8, i: usize) !Layer {
@@ -222,7 +272,7 @@ pub const Model = struct {
         const split = try m.splitBf16(tmp, kv_b, heads);
         defer tmp.free(split.key);
         defer tmp.free(split.value);
-        var cache = try cuda.DeviceBuffer.alloc(self.d, self.capacity * m.absorbed_stride * 2);
+        var cache = try cuda.DeviceBuffer.alloc(self.d, (if (sliding and self.ring) geom.ring.rows else self.capacity) * m.absorbed_stride * 2);
         try cache.fill8(0, null);
         const att: Attention = .{
             .sliding = sliding,
@@ -245,6 +295,7 @@ pub const Model = struct {
             .output_norm = try self.up(ck, p ++ "self_attn.post_proj_norm.weight", .{i}, .bf16, &.{H}),
             .sinks = try self.up(ck, p ++ "self_attn.learnable_sink_param", .{i}, .f32, &.{hh}),
             .cache = cache,
+            .rows = @intCast(cache.len / (m.absorbed_stride * 2)),
             // Below the key budget nothing selects, so a short context carries no indexer state at all.
             .index = if (sliding or self.capacity <= sparse_stride) null else try cuda_index.Layer.load(a, self.d, &self.own, ck, i, t, self.capacity),
         };
@@ -369,13 +420,18 @@ pub const Model = struct {
         defer self.a.free(positions);
         const writes = try self.a.alloc(u32, rows);
         defer self.a.free(writes);
+        const ring_writes = try self.a.alloc(u32, rows);
+        defer self.a.free(ring_writes);
         for (0..rows) |r| {
             const p: i32 = @intCast(start + r);
             positions[r * 3 ..][0..3].* = .{ p, p, p };
             writes[r] = @intCast(start + r);
+            // Sliding layers read and write the ring's slots; with the ring off they keep their position's row.
+            ring_writes[r] = @intCast(if (self.ring) geom.ring.slot(start + r) else start + r);
         }
         try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(positions), s.handle);
         try sc.write_slots.uploadAsync(0, std.mem.sliceAsBytes(writes), s.handle);
+        try sc.write_ring.uploadAsync(0, std.mem.sliceAsBytes(ring_writes), s.handle);
         // Past the budget an indexed row's list comes from the layer's indexer, so nothing is built here.
         const lists = self.capacity > sparse_stride and start + rows - 1 >= sparse_stride;
         const keys_sparse = try self.a.alloc(u32, if (lists) 0 else rows * sparse_stride);
@@ -396,7 +452,7 @@ pub const Model = struct {
             }
             const first = if (pos + 1 > sliding_stride) pos + 1 - sliding_stride else 0;
             counts_sliding[r] = @intCast(pos + 1 - first);
-            for (first..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(j);
+            for (first..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(if (self.ring) geom.ring.slot(j) else j);
         }
         // Engram windows from the committed history.
         const windows = try self.a.alloc([engram.order]u32, rows);
@@ -461,7 +517,7 @@ pub const Model = struct {
                 .value_logits = sc.gate,
                 .positions = sc.positions.ptr,
                 .rotary_table = sc.table,
-                .kv = .{ .projection = sc.kv, .gain = at.kv_norm, .write_slots = sc.write_slots.ptr, .capacity = @intCast(self.capacity), .epsilon = eps },
+                .kv = .{ .projection = sc.kv, .gain = at.kv_norm, .write_slots = if (at.sliding) sc.write_ring.ptr else sc.write_slots.ptr, .capacity = at.rows, .epsilon = eps },
                 .attention = .{
                     .query = sc.absorb,
                     .cache = at.cache.ptr,

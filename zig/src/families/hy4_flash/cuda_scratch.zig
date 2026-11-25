@@ -21,6 +21,54 @@ pub const rotation = 3;
 /// Rows a pass takes at most: the widest row the per-pass scratch and the recall lists are sized for.
 pub const row_cap = 1024;
 
+/// A sliding layer's KV ring: `rows` slots for the positions written last, a position's slot its `pos % rows`.
+pub const ring = struct {
+    /// Keys a sliding row attends at most: the checkpoint's sliding window.
+    pub const window = sliding_stride;
+    /// Rows one pass writes at most.
+    pub const pass_rows = row_cap;
+    /// Slots a ring holds: a pass's own rows plus the window its first row still reads, at a 512-key chunk.
+    pub const rows = 3 * 512;
+
+    /// The slot position `pos` is written to and read from; a reader addresses keys by slot, so no row ever moves.
+    pub fn slot(pos: usize) usize {
+        return pos % rows;
+    }
+
+    /// The oldest position a row at `pos` attends, and the width of its key list.
+    pub fn first(pos: usize) usize {
+        return if (pos + 1 > window) pos + 1 - window else 0;
+    }
+
+    /// Refuse a pass whose own rows would overwrite a slot its earlier rows' windows still read.
+    pub fn check(pass: usize) !void {
+        if (pass == 0 or pass + window - 1 > rows) return error.BadHy4RingPass;
+    }
+};
+
+test "the ring holds a pass and the window its first row reads" {
+    try ring.check(ring.pass_rows);
+    try std.testing.expectError(error.BadHy4RingPass, ring.check(ring.rows - ring.window + 2));
+    try std.testing.expectError(error.BadHy4RingPass, ring.check(0));
+    try std.testing.expectEqual(@as(usize, 0), ring.rows % sliding_stride); // a ring starts and ends on a chunk
+    // A pass that starts just past a wrap: every slot it writes and its first row's window reads is its own.
+    var taken: [ring.rows]bool = @splat(false);
+    const start = 4 * ring.rows - 3;
+    for (ring.first(start)..start + ring.pass_rows) |pos| {
+        const slot = ring.slot(pos);
+        try std.testing.expect(!taken[slot]);
+        taken[slot] = true;
+    }
+    const used = std.mem.count(bool, &taken, &.{true});
+    try std.testing.expectEqual(ring.pass_rows + ring.window - 1, @as(usize, used));
+    // A row's key list is its window, oldest first, and a key's slot is the key's own position's.
+    for ([_]usize{ 0, 1, ring.window - 1, ring.window, 7 * ring.rows + 100 }) |pos| {
+        const first = ring.first(pos);
+        try std.testing.expectEqual(@min(pos + 1, ring.window), pos + 1 - first);
+        for (first..pos + 1) |key| try std.testing.expectEqual(key % ring.rows, ring.slot(key));
+    }
+}
+
 pub const Scratch = struct {
     streams: [rotation]cuda.DeviceBuffer, // [rows, S, H]
     collapsed: u64,
@@ -45,6 +93,7 @@ pub const Scratch = struct {
     slots: cuda.DeviceBuffer,
     counts: cuda.DeviceBuffer,
     write_slots: cuda.DeviceBuffer,
+    write_ring: cuda.DeviceBuffer,
     media: u64,
     latent: u64,
     logits: u64,
@@ -100,6 +149,7 @@ pub fn alloc(d: *const cuda.Driver, own: *cuda.exl3_upload.Uploader, max_rows: u
     sc.slots = try cuda.DeviceBuffer.alloc(d, r * sparse_stride * 4);
     sc.counts = try cuda.DeviceBuffer.alloc(d, r * 4);
     sc.write_slots = try cuda.DeviceBuffer.alloc(d, r * 4);
+    sc.write_ring = try cuda.DeviceBuffer.alloc(d, r * 4);
     sc.media = try zeros(own, r * 4);
     sc.latent = try zeros(own, r * L * 2);
     sc.logits = try zeros(own, r * E * 4);

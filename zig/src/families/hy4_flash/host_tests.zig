@@ -8,6 +8,7 @@ test {
     _ = @import("config.zig");
     _ = @import("attention_slots.zig");
     _ = @import("mla_attention.zig");
+    _ = @import("cuda_scratch.zig");
     _ = @import("index_groups.zig");
     _ = @import("rope.zig");
     _ = @import("rank_weights.zig");
