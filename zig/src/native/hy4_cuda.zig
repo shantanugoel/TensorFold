@@ -1,6 +1,4 @@
-//! Hy4-flash on the native CUDA server: our v3a pack's text path (dense EXL3 groups, the indexer, the sliding
-//! layers' ring) behind the lane host. One sequence at a time for now, so requests queue; vision, 8-bit KV, DFly2,
-//! prompt-cache checkpoints and batching are the plan's later steps.
+//! Hy4-flash on the native CUDA server: our v3a pack's text path (dense EXL3 groups, the indexer, the ring).
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -165,8 +163,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer h.k.deinit();
     h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
-    // The last load-time allocations are in: KV, the indexer's keys, the recall scores and the dense scratch. A GB10's
-    // device memory is the system's, so the floor is read here and not inferred from the loader's per-layer guard.
+    // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
     const bytes = h.c.bytes();
     const avail = family.memAvailable();
     if (avail < floor_gib << 30) {

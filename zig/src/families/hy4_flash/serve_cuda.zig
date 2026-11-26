@@ -1,5 +1,4 @@
-//! Hy4-flash behind the lane engine on CUDA: one sequence, the step 1-3 text model (dense EXL3 groups, the indexer,
-//! the sliding layers' ring). A prompt fills in `prompt_rows`-row passes; a reply is one row a pass.
+//! Hy4-flash behind the lane engine on CUDA: one sequence, the step 1-3 text model with the indexer and the ring.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -40,8 +39,7 @@ pub fn memAvailable() u64 {
     return @import("cuda_load_util.zig").memAvailable();
 }
 
-/// Per-token cache bytes the model's own caches take at its capacity: the KV of the layers that keep all of it, their
-/// indexer's keys and the recall scores. The ring is flat, so it takes no part in a size decision.
+/// Per-token bytes the model's caches take at its capacity: the full-length KV, the indexer's keys and the scores.
 pub fn bytesPerToken(m: *const model.Model) u64 {
     const b = cacheBytes(m);
     return (b.kv + b.index + b.scores) / @max(@as(u64, m.capacity), 1);
@@ -93,20 +91,13 @@ pub const Cuda = struct {
         return cacheBytes(self.m);
     }
 
-    /// The slot position `pos` is written to and read from: its own, or its place in the ring. `Model.pass` refuses a
-    /// pass past `capacity`, so a slot is inside its layer's arena — the write kernel would skip it silently otherwise.
-    pub fn writeSlot(self: *const Cuda, pos: usize) usize {
-        return if (self.m.ring) geom.ring.slot(pos) else pos;
-    }
-
     /// The oldest position a rewind to length `r` may read: its first row's window must still hold its own rows.
     pub fn mayRewind(self: *const Cuda, r: u32) bool {
         const first = if (r + 1 > ring_window) r + 1 - ring_window else 0;
         return first >= self.valid_from;
     }
 
-    /// After a pass: the ring's high-water mark. Slots hold the last `ring_rows` positions written, so nothing before
-    /// `H + 1 - ring_rows` is readable any more.
+    /// After a pass: the ring's high-water mark, so nothing before `H + 1 - ring_rows` is readable any more.
     fn bump(self: *Cuda) void {
         const h = self.m.history.items.len;
         const from = if (h > ring_rows) h - ring_rows else 0;
@@ -116,6 +107,7 @@ pub const Cuda = struct {
     /// `tokens` at the caches' end: the model's pass, then the ring's bookkeeping and the timers.
     pub fn pass(self: *Cuda, tokens: []const u32) !void {
         const start = self.m.history.items.len;
+        // Inside `capacity`, every write slot is inside its layer's arena: the write kernel skips a stray one silently.
         if (start + tokens.len > self.m.capacity) return error.Hy4ContextFull;
         // The model appends before it forwards: a failed pass leaves the history claiming rows nothing wrote.
         errdefer {
@@ -136,8 +128,7 @@ pub const Cuda = struct {
         self.bump();
     }
 
-    /// The row's draw: greedy in the model's own FP32 logits (the dev binary's argmax), else the lane sampler over the
-    /// same row rounded to bf16 the way a bf16 head would write it.
+    /// The row's draw: greedy in the model's FP32 logits, else the lane sampler over the same row as bf16 words.
     fn draw(self: *Cuda, s: *lanes.Stream, position: u64, mask: []const u32) !u32 {
         if (mask.len == 0) {
             if (s.sampling) |v| {
@@ -193,8 +184,7 @@ pub const Cuda = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    /// The prompt into the caches, in `prompt_rows`-row passes. A prompt that shares the kept caches' prefix resumes
-    /// there when the ring still holds the rows its first new row reads; otherwise it fills from row 0.
+    /// The prompt into the caches in `prompt_rows`-row passes, resuming the kept caches' shared prefix where it may.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = cast(ptr);
         const ids = s.prompt();
@@ -224,8 +214,7 @@ pub const Cuda = struct {
         return from;
     }
 
-    /// The row a fill starts at: the kept caches' shared prefix, when it is long enough to be worth keeping and the ring
-    /// still holds the rows its first new row reads. The history is cut to it, and the caches are no longer kept.
+    /// The row a fill starts at: the kept shared prefix, when it is long enough and the ring still holds its first row.
     pub fn reuseFrom(self: *Cuda, ids: []const u32) usize {
         var from: usize = 0;
         if (self.kept and ids.len > 0) {
@@ -417,7 +406,7 @@ test "a prompt resumes at its shared prefix only above the keep floor and inside
     try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(&prompt));
     try std.testing.expectEqual(@as(usize, 0), m.history.items.len);
 
-    // A prefix the ring no longer holds: at 300 rows of a 2,403-row fill its first new row would read an overwritten slot.
+    // A prefix the ring no longer holds: 300 rows into a 2,403-row fill, its first new row reads an overwritten slot.
     prompt[300] = 6;
     m.history = .{ .items = hist[0..2403], .capacity = hist.len, .pointer_stability = .{} };
     c.valid_from = 2403 - ring_rows;

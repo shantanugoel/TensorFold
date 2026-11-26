@@ -1,5 +1,4 @@
-//! The server's prefix reuse against a fresh fill, on a device: the same prompt continued after both arms must give
-//! byte-identical logits and the same greedy tokens, including a resume at an unaligned row past the ring's wrap.
+//! Prefix reuse against a fresh fill, on a device: both arms' logits and greedy tokens must be byte-identical.
 const std = @import("std");
 const cuda = @import("cuda");
 const model = @import("cuda_model.zig");

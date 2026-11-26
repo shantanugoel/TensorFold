@@ -205,8 +205,7 @@ fn thinkingSwitch(v: ?Value) ?bool {
 
 pub const Thinking = struct { effort: ?[]const u8 = null, enable: ?bool = null, clear: ?bool = null };
 
-/// ``thinking_fields``: a request's effort and thinking switch where it sets them. `off` is the template's own
-/// thinking-off name (`Server.off_effort`), the only off effort a request may ask for.
+/// ``thinking_fields``: the request's effort and switch; `off` is the template's own off name, the only one accepted.
 pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8, off: ?[]const u8) errors.Refused!Thinking {
     var out: Thinking = .{};
     const raw = body.get("chat_template_kwargs");
@@ -302,8 +301,7 @@ pub fn effortLevels(a: Allocator, template: []const u8) Allocator.Error![]const 
     return found.items;
 }
 
-/// The off switch a template names in quotes for its own thinking gate: Hy4-flash's ``no_think`` keys thinking on it
-/// alone, with no ``enable_thinking`` in the source at all. Null: the template names no such switch.
+/// The off switch a template names in quotes for its thinking gate (Hy4-flash's ``no_think``); null: it names none.
 pub fn offEffort(template: []const u8) ?[]const u8 {
     for (off_efforts) |name| if (quoted(template, name)) return name;
     return null;
