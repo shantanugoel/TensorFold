@@ -1,6 +1,5 @@
 //! Hy4-flash text model on CUDA for EXL3 routed experts with BF16 elsewhere; one sequence, causal or windowed keys.
 const std = @import("std");
-const core = @import("core");
 const cuda = @import("cuda");
 const config = @import("config.zig");
 const ihc = @import("ihc.zig");
@@ -8,11 +7,8 @@ const ihc_cuda = @import("ihc_cuda.zig");
 const mla = @import("mla_cuda.zig");
 const m = @import("mla_weights.zig");
 const attn = @import("mla_attention.zig");
-const rope = @import("rope.zig");
 const exl3 = @import("moe_exl3_cuda.zig");
-const expert_weights = @import("exl3_weights.zig");
 const dense = @import("dense_weights.zig");
-const load_util = @import("cuda_load_util.zig");
 const engram = @import("engram.zig");
 const engram_cuda = @import("engram_cuda.zig");
 const direct = @import("bf16_rows.zig");
@@ -66,9 +62,9 @@ pub const Kernels = struct {
     }
 };
 
-const Hc = struct { project: u64, bias: u64, scale: u64 };
+pub const Hc = struct { project: u64, bias: u64, scale: u64 };
 
-const Attention = struct {
+pub const Attention = struct {
     sliding: bool,
     heads: u32,
     hc: Hc,
@@ -89,8 +85,8 @@ const Attention = struct {
     index: ?*cuda_index.Layer = null,
 };
 
-const Dense = struct { gate: dense.Projection, up: dense.Projection, down: dense.Projection };
-const Sparse = struct {
+pub const Dense = struct { gate: dense.Projection, up: dense.Projection, down: dense.Projection };
+pub const Sparse = struct {
     latent_in: u64,
     latent_out: u64,
     shared_gate: dense.Projection,
@@ -101,21 +97,24 @@ const Sparse = struct {
     routed: exl3.Routed,
 };
 
-const Feed = struct {
+pub const Feed = struct {
     hc: Hc,
     input_norm: u64,
     output_norm: u64,
     mlp: union(enum) { dense: Dense, sparse: Sparse },
 };
 
-const Engram = struct {
+pub const Engram = struct {
     w: engram_cuda.Weights,
     table: direct.Table,
 };
 
-const Layer = struct { engram: ?Engram, attention: Attention, feed: Feed };
+pub const Layer = struct { engram: ?Engram, attention: Attention, feed: Feed };
 
 pub const Model = struct {
+    /// The weight map, one layer's load and the per-pass scratch: `cuda_model_load.zig`, the forward's other half.
+    pub const open = @import("cuda_model_load.zig").open;
+
     a: std.mem.Allocator,
     io: std.Io,
     d: *const cuda.Driver,
@@ -142,268 +141,12 @@ pub const Model = struct {
     /// Host nanoseconds a pass spent on the Engram rows: planning, reading and waiting.
     engram_ns: i96 = 0,
 
-    fn tensor(ck: *core.Checkpoint, name: []const u8, dtype: anytype, shape: []const usize) ![]const u8 {
-        const t = try ck.get(name);
-        if (!t.is(dtype, shape)) {
-            std.debug.print("unexpected tensor {s}: {any} {any}\n", .{ name, t.dtype, t.shape[0..t.rank] });
-            return error.BadHy4CheckpointTensor;
-        }
-        return t.bytes;
-    }
-
-    fn up(self: *Model, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype, dtype: anytype, shape: []const usize) !u64 {
-        var buf: [192]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, fmt, args);
-        return self.own.dev(try tensor(ck, name, dtype, shape));
-    }
-
     /// What one load takes: the context's rows, the widest pass, and whether sliding layers keep a ring.
     pub const Options = struct {
         capacity: usize,
         max_rows: usize,
         ring: bool = true,
     };
-
-    pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *Kernels, dir: []const u8, o: Options) !*Model {
-        const capacity = o.capacity;
-        const max_rows = o.max_rows;
-        const cfg = try config.parse(a, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 20)));
-        const t = cfg.value.text_config;
-        if (t.hidden_size != H or t.hc_mult != S or t.routed_expert_hidden_size != L or t.moe_intermediate_size != L or
-            t.intermediate_size != D or t.n_routed_experts != E or t.num_experts_per_tok != K or t.q_lora_rank != Q)
-            return error.BadHy4ModelShape;
-        // Past the 2,048-key budget an indexed row attends recall lists, so capacity is free up to the scores' width.
-        if (capacity == 0 or capacity > cuda_index.max_capacity or max_rows == 0 or max_rows > geom.row_cap) return error.BadHy4RunnerCapacity;
-        if (o.ring) try geom.ring.check(max_rows);
-        const ck = try a.create(core.Checkpoint);
-        ck.* = try core.Checkpoint.openModel(a, io, dir);
-        const self = try a.create(Model);
-        self.* = .{
-            .a = a,
-            .io = io,
-            .d = d,
-            .s = s,
-            .k = k,
-            .text = t,
-            // Upload tables and staging go through a freeing allocator: the arena would keep them all.
-            .own = .{ .d = d, .gpa = std.heap.page_allocator, .max_buffers = 1 << 20, .slab = 256 << 20 },
-            .layers = try a.alloc(Layer, t.num_hidden_layers),
-            .embed = undefined,
-            .head_hc = undefined,
-            .final_norm = undefined,
-            .lm_head = undefined,
-            .scratch = undefined,
-            .index = undefined,
-            .max_rows = max_rows,
-            .capacity = capacity,
-            .ring = o.ring,
-        };
-        const V: usize = t.vocab_size;
-        self.embed = try self.up(ck, "model.embed_tokens.weight", .{}, .bf16, &.{ V, H });
-        self.head_hc = .{
-            .project = try self.up(ck, "model.hc_head.hc_head_fn", .{}, .f32, &.{ S, S * H }),
-            .bias = try self.up(ck, "model.hc_head.hc_head_base", .{}, .f32, &.{S}),
-            .scale = try self.up(ck, "model.hc_head.hc_head_scale", .{}, .f32, &.{1}),
-        };
-        self.final_norm = try self.up(ck, "model.norm.weight", .{}, .bf16, &.{H});
-        self.lm_head = try dense.read(&self.own, ck, "lm_head", .{}, V, H, .bf16);
-        ck.release();
-        // UMA guard: device memory is not charged to the cgroup, so stop before the system runs dry.
-        const floor_gib = try @import("sys").environment.read(usize, "TF_HY4_MEM_FLOOR_GIB", 10);
-        for (self.layers, 0..) |*layer, i| {
-            const avail = load_util.memAvailable();
-            std.debug.print("layer {d:>2}: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ i, load_util.gib(self.own.bytes), load_util.gib(avail) });
-            if (avail < floor_gib << 30) {
-                std.debug.print("stopping: MemAvailable below the {d} GiB floor\n", .{floor_gib});
-                return error.Hy4MemoryFloor;
-            }
-            layer.* = try self.loadLayer(a, io, ck, dir, i);
-            // The layer is on the device: its mapped shard pages (and page cache) would otherwise stay resident.
-            ck.release();
-        }
-        // The Engram tables in layer order: a pass reads them all at once, so the order has to be the layers'.
-        var engram_count: usize = 0;
-        for (self.layers) |l| engram_count += @intFromBool(l.engram != null);
-        const engrams = try a.alloc(*const direct.Table, engram_count);
-        var seen: usize = 0;
-        for (self.layers) |*l| if (l.engram) |*e| {
-            engrams[seen] = &e.table;
-            seen += 1;
-        };
-        self.engrams = engrams;
-        // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor
-        try @import("loader.zig").finishCuda(ck, cfg.value);
-        std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
-        self.weight_bytes = self.own.bytes;
-        self.scratch = try geom.alloc(self.d, &self.own, self.max_rows, self.text.vocab_size);
-        self.index = try cuda_index.Scratch.init(self.d, self.max_rows, self.capacity);
-        try self.reserveDense();
-        // The pieces that grow with the context, so a size decision is read and not inferred: the KV, the indexer's
-        // two key caches (which grow with the context too and showed in no figure) and the recall scores.
-        var kv_bytes: usize = 0;
-        var index_bytes: usize = 0;
-        var sliding: usize = 0;
-        var indexers: usize = 0;
-        for (self.layers) |layer| {
-            kv_bytes += @as(usize, layer.attention.rows) * m.absorbed_stride * 2;
-            sliding += @intFromBool(layer.attention.sliding);
-            if (layer.attention.index) |ix| {
-                index_bytes += ix.token_keys.len + ix.group_keys.len;
-                indexers += 1;
-            }
-        }
-        std.debug.print("capacity {d}: KV {d:.2} GiB ({d} B a token over {d} indexed layers, {d} sliding at {d} rows), indexer keys {d:.2} GiB ({d} B a token over {d} layers), recall scores {d:.0} MiB\n", .{
-            self.capacity,
-            load_util.gib(kv_bytes),
-            (self.layers.len - sliding) * m.absorbed_stride * 2,
-            self.layers.len - sliding,
-            sliding,
-            if (self.ring) geom.ring.rows else self.capacity,
-            load_util.gib(index_bytes),
-            index_bytes / @max(self.capacity, 1),
-            indexers,
-            @as(f64, @floatFromInt(self.index.scoreBytes())) / (1 << 20),
-        });
-        return self;
-    }
-
-    /// The shared EXL3 scratch at its widest, inside the load's memory accounting instead of the first forward's.
-    fn reserveDense(self: *Model) !void {
-        for (self.layers) |layer| {
-            const att = [3]dense.Projection{ layer.attention.q_b, layer.attention.gate, layer.attention.output };
-            const feed = switch (layer.feed.mlp) {
-                .dense => |dn| [3]dense.Projection{ dn.gate, dn.up, dn.down },
-                .sparse => |sp| [3]dense.Projection{ sp.shared_gate, sp.shared_up, sp.shared_down },
-            };
-            for (att ++ feed) |p| switch (p.weight) {
-                .bf16 => {},
-                .exl3 => |w| try self.k.dense.reserve(self.s, w),
-            };
-        }
-        switch (self.lm_head.weight) {
-            .bf16 => {},
-            .exl3 => |w| try self.k.dense.reserve(self.s, w),
-        }
-        var bytes: usize = 0;
-        for ([_]?cuda.DeviceBuffer{ self.k.dense.xh, self.k.dense.z, self.k.dense.counters }) |slot| bytes += if (slot) |b| b.len else 0;
-        std.debug.print("EXL3 dense scratch {d:.1} MiB\n", .{@as(f64, @floatFromInt(bytes)) / (1 << 20)});
-    }
-
-    fn loadLayer(self: *Model, a: std.mem.Allocator, io: std.Io, ck: *core.Checkpoint, dir: []const u8, i: usize) !Layer {
-        const t = self.text;
-        const sliding = t.layer_types[i] == .sliding_attention;
-        const heads: u32 = if (sliding) t.swa_num_attention_heads else t.num_attention_heads;
-        const hh: usize = heads;
-        const p = "model.layers.{d}.";
-        var kv_b_name: [96]u8 = undefined;
-        const kv_b = try tensor(ck, try std.fmt.bufPrint(&kv_b_name, p ++ "self_attn.kv_b_proj.weight", .{i}), .bf16, &.{ hh * (m.nope + m.value_width), m.latent });
-        const tmp = std.heap.page_allocator;
-        const split = try m.splitBf16(tmp, kv_b, heads);
-        defer tmp.free(split.key);
-        defer tmp.free(split.value);
-        var cache = try cuda.DeviceBuffer.alloc(self.d, (if (sliding and self.ring) geom.ring.rows else self.capacity) * m.absorbed_stride * 2);
-        try cache.fill8(0, null);
-        const att: Attention = .{
-            .sliding = sliding,
-            .heads = heads,
-            .hc = .{
-                .project = try self.up(ck, p ++ "hc_attn_layer.hc_pre.hc_fn", .{i}, .f32, &.{ 2 * S, S * H }),
-                .bias = try self.up(ck, p ++ "hc_attn_layer.hc_pre.hc_base", .{i}, .f32, &.{2 * S}),
-                .scale = try self.up(ck, p ++ "hc_attn_layer.hc_pre.hc_scale", .{i}, .f32, &.{2}),
-            },
-            .input_norm = try self.up(ck, p ++ "input_layernorm.weight", .{i}, .bf16, &.{H}),
-            .q_a = try self.up(ck, p ++ "self_attn.q_a_proj.weight", .{i}, .bf16, &.{ Q, H }),
-            .q_norm = try self.up(ck, p ++ "self_attn.q_a_layernorm.weight", .{i}, .bf16, &.{Q}),
-            .q_b = try dense.read(&self.own, ck, p ++ "self_attn.q_b_proj", .{i}, hh * m.query_stride, Q, .bf16),
-            .kv_a = try self.up(ck, p ++ "self_attn.kv_a_proj_with_mqa.weight", .{i}, .bf16, &.{ m.absorbed_stride, H }),
-            .kv_norm = try self.up(ck, p ++ "self_attn.kv_a_layernorm.weight", .{i}, .bf16, &.{m.latent}),
-            .key = try self.own.dev(std.mem.sliceAsBytes(split.key)),
-            .value = try self.own.dev(std.mem.sliceAsBytes(split.value)),
-            .gate = try dense.read(&self.own, ck, p ++ "self_attn.linear_gate", .{i}, hh * m.value_width, H, .bf16),
-            .output = try dense.read(&self.own, ck, p ++ "self_attn.o_proj", .{i}, H, hh * m.value_width, .bf16),
-            .output_norm = try self.up(ck, p ++ "self_attn.post_proj_norm.weight", .{i}, .bf16, &.{H}),
-            .sinks = try self.up(ck, p ++ "self_attn.learnable_sink_param", .{i}, .f32, &.{hh}),
-            .cache = cache,
-            .rows = @intCast(cache.len / (m.absorbed_stride * 2)),
-            // Below the key budget nothing selects, so a short context carries no indexer state at all.
-            .index = if (sliding or self.capacity <= sparse_stride) null else try cuda_index.Layer.load(a, self.d, &self.own, ck, i, t, self.capacity),
-        };
-        const is_dense = t.mlp_layer_types[i] == .dense;
-        const feed: Feed = .{
-            .hc = .{
-                .project = try self.up(ck, p ++ "hc_mlp_layer.hc_pre.hc_fn", .{i}, .f32, &.{ 2 * S, S * H }),
-                .bias = try self.up(ck, p ++ "hc_mlp_layer.hc_pre.hc_base", .{i}, .f32, &.{2 * S}),
-                .scale = try self.up(ck, p ++ "hc_mlp_layer.hc_pre.hc_scale", .{i}, .f32, &.{2}),
-            },
-            .input_norm = try self.up(ck, p ++ "post_attention_layernorm.weight", .{i}, .bf16, &.{H}),
-            .output_norm = if (is_dense)
-                try self.up(ck, p ++ "mlp.post_fc2_norm.weight", .{i}, .bf16, &.{H})
-            else
-                try self.up(ck, p ++ "mlp.combine_output_norm.weight", .{i}, .bf16, &.{H}),
-            .mlp = if (is_dense) .{ .dense = .{
-                .gate = try dense.read(&self.own, ck, p ++ "mlp.gate_proj", .{i}, D, H, .bf16),
-                .up = try dense.read(&self.own, ck, p ++ "mlp.up_proj", .{i}, D, H, .bf16),
-                .down = try dense.read(&self.own, ck, p ++ "mlp.down_proj", .{i}, H, D, .bf16),
-            } } else .{ .sparse = blk: {
-                const experts = try std.heap.page_allocator.alloc(expert_weights.Expert, E);
-                defer std.heap.page_allocator.free(experts);
-                for (experts, 0..) |*e, j| e.* = try expert_weights.readExpert(ck, i, j, L, L);
-                break :blk .{
-                    .latent_in = try self.up(ck, p ++ "mlp.routed_expert_down_proj.weight", .{i}, .bf16, &.{ L, H }),
-                    .latent_out = try self.up(ck, p ++ "mlp.routed_expert_up_proj.weight", .{i}, .bf16, &.{ H, L }),
-                    .shared_gate = try dense.read(&self.own, ck, p ++ "mlp.shared_experts.gate_proj", .{i}, L, H, .bf16),
-                    .shared_up = try dense.read(&self.own, ck, p ++ "mlp.shared_experts.up_proj", .{i}, L, H, .bf16),
-                    .shared_down = try dense.read(&self.own, ck, p ++ "mlp.shared_experts.down_proj", .{i}, H, L, .bf16),
-                    .router = try self.up(ck, p ++ "mlp.gate.weight", .{i}, .bf16, &.{ E, H }),
-                    .router_bias = try self.up(ck, p ++ "mlp.gate.e_score_correction_bias", .{i}, .f32, &.{E}),
-                    .routed = try exl3.Routed.init(&self.own, experts, L, L, self.max_rows, K, t.swiglu_limit, &self.expert_scratch),
-                };
-            } },
-        };
-        var eng: ?Engram = null;
-        if (std.mem.indexOfScalar(u32, t.engram_layer_ids, @intCast(i + 1)) != null) {
-            const e = "model.layers.{d}.engram_layer.";
-            const ein: usize = engram_cuda.input;
-            var key: [S]u64 = undefined;
-            for (&key, 0..) |*dst, j| dst.* = try self.up(ck, e ++ "key_projs.{d}.weight", .{ i, j }, .bf16, &.{ H, ein });
-            const cat = struct {
-                fn run(mm: *Model, c: *core.Checkpoint, layer: usize, comptime fmt: []const u8, count: usize, size: usize) !u64 {
-                    const out = try mm.a.alloc(u8, count * size * 2);
-                    defer mm.a.free(out);
-                    for (0..count) |j| {
-                        var nb: [128]u8 = undefined;
-                        @memcpy(out[j * size * 2 ..][0 .. size * 2], try tensor(c, try std.fmt.bufPrint(&nb, fmt, .{ layer, j }), .bf16, &.{size}));
-                    }
-                    return mm.own.dev(out);
-                }
-            }.run;
-            const w: engram_cuda.Weights = .{
-                .lookup_gamma = try cat(self, ck, i, e ++ "lookup_per_head_norms.{d}.weight", engram_cuda.columns, engram_cuda.head_width),
-                .value = try self.up(ck, e ++ "value_proj.weight", .{i}, .bf16, &.{ H, ein }),
-                .value_bias = try self.up(ck, e ++ "value_proj.bias", .{i}, .bf16, &.{H}),
-                .value_gain = try self.up(ck, e ++ "unified_pre_gamma", .{i}, .bf16, &.{H}),
-                .key = key,
-                .key_bias = try cat(self, ck, i, e ++ "key_projs.{d}.bias", S, H),
-                .key_gain = try cat(self, ck, i, e ++ "norm_key.{d}.weight", S, H),
-                .query_gain = try cat(self, ck, i, e ++ "norm_query.{d}.weight", S, H),
-                .delta_gain = try cat(self, ck, i, e ++ "unified_per_hc_scales.{d}", S, H),
-            };
-            var nb: [128]u8 = undefined;
-            const lookup = (try ck.get(try std.fmt.bufPrint(&nb, e ++ "lookup_table", .{i}))).bytes;
-            const map = try engram.TokenMap.open(lookup, t);
-            const hash = try engram.Layer.open(t, @intCast(i + 1));
-            var tb: [128]u8 = undefined;
-            const table_name = try std.fmt.bufPrint(&tb, e ++ "multi_head_embedding.embedding.weight", .{i});
-            const shard = try load_util.shardOf(a, io, dir, table_name);
-            // The config's per-layer row count, so a wrong or repacked table fails here and not mid-forward.
-            const rows_expected = try t.engramRows(@intCast(i + 1));
-            var table = try direct.openDirect(a, shard, table_name, map, hash, rows_expected);
-            errdefer table.close();
-            try ck.skip(table_name);
-            eng = .{ .w = w, .table = table };
-        }
-        return .{ .engram = eng, .attention = att, .feed = feed };
-    }
 
     fn hcShape(self: *const Model, rows: usize, gates: u32) ihc.Shape {
         return .{ .rows = @intCast(rows), .width = H, .gates = gates, .eps = self.text.rms_norm_eps, .gate_eps = self.text.hc_eps, .post_magnitude = self.text.hc_magnitude };
@@ -483,8 +226,7 @@ pub const Model = struct {
             counts_sliding[r] = @intCast(pos + 1 - first);
             for (first..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(if (self.ring) geom.ring.slot(j) else j);
         }
-        // Engram windows from the committed history, and every table's rows read while the pass runs: a row's
-        // hash depends only on the token ids, so all four tables are planned and started here, not a layer at a time.
+        // Engram rows for the whole pass: a row hashes from the token ids alone, so all four tables start at once.
         const windows = try self.a.alloc([engram.order]u32, rows);
         defer self.a.free(windows);
         const pad = self.text.engram_pad_id;
