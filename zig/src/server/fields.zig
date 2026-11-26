@@ -224,7 +224,7 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8, off: ?[]
         effort = k.field("reasoning_effort");
     };
     if (effort) |e| {
-        if (e != .string or !isEffort(e.string, levels, off)) return if (off) |name|
+        if (e != .string or !isEffort(e.string, off)) return if (off) |name|
             cx.fail(.request, "reasoning_effort must be none, minimal, low, medium, high, xhigh or max, or {s} for this template's thinking off", .{name})
         else
             cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
@@ -251,9 +251,8 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8, off: ?[]
     return out;
 }
 
-fn isEffort(s: []const u8, levels: []const []const u8, off: ?[]const u8) bool {
+fn isEffort(s: []const u8, off: ?[]const u8) bool {
     for (efforts) |e| if (std.mem.eql(u8, e, s)) return true;
-    for (levels) |l| if (std.mem.eql(u8, l, s)) return true; // the template's own quoted names
     return isOff(s, off);
 }
 
@@ -320,16 +319,6 @@ fn quoted(template: []const u8, name: []const u8) bool {
         if ((open == '\'' or open == '"') and (close == '\'' or close == '"')) return true;
     }
     return false;
-}
-
-/// The effort a request names: its own ``reasoning_effort``, else ``chat_template_kwargs.reasoning_effort``, which a
-/// client sends the way Tabby's does (Hy4-flash keys thinking off on ``no_think``).
-pub fn requestedEffort(body: Value) ?[]const u8 {
-    if (body.field("reasoning_effort")) |e| if (e == .string) return e.string;
-    const kwargs = body.field("chat_template_kwargs") orelse return null;
-    if (kwargs != .object) return null;
-    if (kwargs.get("reasoning_effort")) |e| if (e == .string) return e.string;
-    return null;
 }
 
 /// Choices a request may ask for: each is its own engine request on the one prompt.
