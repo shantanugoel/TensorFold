@@ -169,7 +169,23 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const bytes = h.c.bytes();
     const avail = family.memAvailable();
     if (avail < floor_gib << 30) return refuse(a, problem, "{s}", .{try floorRefusal(a, capacity, family.bytesPerToken(h.c.m), avail, floor_gib)});
-    h.cfg = try lanes.Config.init(gpa, family.Cuda.facts(h.c), family.max_window, family.max_window - 1);
+    // The depth rule prices a round from the widths' own times: without them it drafts one a round whatever
+    // the block would accept (a prior). `timeWindows` leaves the caches empty, as a cold load has them.
+    var facts = family.Cuda.facts(h.c);
+    var windows: [family.max_window]lanes.config.Cost = undefined;
+    var timed: ?family.Cuda.Timed = null;
+    if (h.c.m.draft != null) timed = h.c.timeWindows() catch |e| ret: {
+        std.log.warn("hy4-cuda: the window timing failed ({s}); the depth rule keeps its prior", .{@errorName(e)});
+        h.c.m.history.items.len = 0;
+        h.c.valid_from = 0;
+        break :ret null;
+    };
+    if (timed) |t| {
+        for (&windows, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t.rows[i] };
+        facts.window_costs = &windows;
+        facts.mtp_step_ms = t.slot_ms;
+    }
+    h.cfg = try lanes.Config.init(gpa, facts, family.max_window, family.max_window - 1);
     errdefer h.cfg.deinit(gpa);
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.c.backend(), h.clock.clock());

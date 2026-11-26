@@ -6,10 +6,16 @@ const model = @import("cuda_model.zig");
 const dfly = @import("cuda_draft.zig");
 const family = @import("serve_cuda.zig");
 
-const usage = "usage: tf-hy4-cuda-draft MODEL_DIR PROMPT.u32 CAPACITY [ROWS]\n" ++
+/// Most blocks a width's KL distribution keeps, for the median and p90 (`POSITIONS` is read up to this).
+const most_blocks = 512;
+
+const usage = "usage: tf-hy4-cuda-draft MODEL_DIR PROMPT.u32 CAPACITY [ROWS] [POSITIONS]\n" ++
     "  PROMPT.u32  little-endian u32 token ids\n" ++
     "  CAPACITY    the context the model keeps, in slots (past 2,048 the indexer runs too)\n" ++
-    "  ROWS        the verify window's rows (default 6)\n";
+    "  ROWS        the verify window's rows (default 6)\n" ++
+    "  POSITIONS   instead of the round checks, measure the row count: that many rows a window width,\n" ++
+    "              every row against the same row fed one at a time (KL, top-1, max |delta logit|)\n" ++
+    "  TRACE       1: also compare one row's hidden state after every layer, two ways, to place a difference\n";
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -23,6 +29,8 @@ pub fn main(init: std.process.Init) !void {
     const prompt = try readIds(a, io, args[2]);
     const capacity = try std.fmt.parseInt(usize, args[3], 10);
     const rows: usize = if (args.len > 4) try std.fmt.parseInt(usize, args[4], 10) else dfly.width;
+    const positions: usize = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 0;
+    const trace: bool = if (args.len > 6) (try std.fmt.parseInt(u32, args[6], 10)) != 0 else false;
     if (prompt.len < 8 or rows < 2 or rows > dfly.width) return error.BadArgs;
 
     var driver = try cuda.Driver.open();
@@ -42,13 +50,21 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("loaded: {d}-slot context, {d}-row window, prompt {d} tokens\n", .{ capacity, rows, prompt.len });
 
     // The prompt, then the anchor's own row as the plain path draws it.
-    try c.pass(prompt);
+    _ = try c.fill(prompt, null); // a prompt longer than one pass fills in `prompt_rows` chunks
     const one = try a.alloc(f32, V);
     const block = try a.alloc(f32, rows * V);
     const wide = try a.alloc(f32, rows * V);
     const anchor = m.history.items.len;
     const bonus = argmax(c.logits);
     std.debug.print("anchor {d}, plain draw {d}\n", .{ anchor, bonus });
+
+    // The row count on its own: nothing else in this program runs, so a difference is the pass's and not a
+    // round's. Every width sees the same greedy token stream, so the arms differ only in how many rows go
+    // through one forward.
+    if (positions > 0) {
+        try measureRows(a, c, prompt.len, positions, argmax(c.logits), trace);
+        return;
+    }
 
     // (1) the anchor alone, the plain one-row path with the LM head's own 128-row block.
     const ids1 = [1]u32{bonus};
@@ -90,15 +106,18 @@ pub fn main(init: std.process.Init) !void {
 
     // (4) eight rounds as the server runs them: propose, verify the window, keep the accepted prefix. Then the
     // same eight steps one row at a time from the same prompt: the two streams are the D1 comparison in miniature.
-    const steps = 8;
+    const steps = 32;
     var plain: [steps]u32 = undefined;
     var drafted: [steps]u32 = undefined;
     var accepted: usize = 0;
     var proposed: usize = 0;
+    var slot_proposed: [dfly.drafts]usize = @splat(0);
+    var slot_kept: [dfly.drafts]usize = @splat(0);
+    var rounds: usize = 0;
     for (0..2) |arm| {
         m.history.items.len = prompt.len;
         c.valid_from = 0;
-        if (arm == 0) try c.pass(prompt); // the logits the first draw comes from
+        if (arm == 0) _ = try c.fill(prompt, null); // the logits the first draw comes from
         var pending = argmax(c.logits);
         var prev_kept: usize = 1; // the last kept row of the pass before this round
         for (0..steps) |step| {
@@ -116,9 +135,12 @@ pub fn main(init: std.process.Init) !void {
                 for (0..depth) |i| ids[1 + i] = hold[i];
                 try m.passRows(ids[0..rows], c.logits, .{ .at = 0, .out = block[0 .. rows * V], .head = rows });
                 var kept: usize = 1;
+                rounds += 1;
                 for (0..depth) |i| {
                     proposed += 1;
+                    slot_proposed[i] += 1;
                     if (argmax(block[i * V ..][0..V]) != hold[i]) break;
+                    slot_kept[i] += 1;
                     kept += 1;
                     accepted += 1;
                 }
@@ -130,13 +152,247 @@ pub fn main(init: std.process.Init) !void {
             pending = draw;
         }
         if (arm == 0) {
-            std.debug.print("plain 8: {any}\n", .{plain});
+            std.debug.print("plain {d}: {any}\n", .{ steps, plain });
             m.history.items.len = prompt.len;
-        } else std.debug.print("drafted 8: {any} ({d}/{d} drafts accepted)\n", .{ drafted, accepted, proposed });
+        } else {
+            std.debug.print("drafted {d}: {any}\n", .{ steps, drafted });
+            std.debug.print("{d}/{d} drafts accepted over {d} rounds = {d:.2} a step; by slot:\n", .{ accepted, proposed, rounds, @as(f64, @floatFromInt(accepted)) / @as(f64, @floatFromInt(@max(rounds, 1))) });
+            for (0..dfly.drafts) |i| if (slot_proposed[i] > 0)
+                std.debug.print("  slot {d}: {d} of {d} kept ({d:.2})\n", .{ i + 1, slot_kept[i], slot_proposed[i], @as(f64, @floatFromInt(slot_kept[i])) / @as(f64, @floatFromInt(slot_proposed[i])) });
+        }
     }
     var agree: usize = 0;
     for (plain, drafted) |x, y| agree += @intFromBool(x == y);
     std.debug.print("the two streams agree on {d}/{d} tokens\n", .{ agree, steps });
+}
+
+/// A pass's cost by head block and row count: the plain step (`head` null: the head's own 128-row block) against
+/// the same row with the head at 1, and a window of `width` rows against the same rows one at a time.
+fn timeShapes(a: std.mem.Allocator, c: *family.Cuda, from: usize) !void {
+    const m = c.m;
+    const V: usize = m.text.vocab_size;
+    const ids = try a.alloc(u32, dfly.width);
+    for (ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
+    const out = try a.alloc(f32, dfly.width * V);
+    std.debug.print("a pass by shape (median of 7):\n", .{});
+    const shapes = [_]struct { name: []const u8, rows: usize, head: ?usize }{
+        .{ .name = "1 row, head's own 128-row block", .rows = 1, .head = null },
+        .{ .name = "1 row, head at 1", .rows = 1, .head = 1 },
+        .{ .name = "2 rows, head at 2", .rows = 2, .head = 2 },
+        .{ .name = "6 rows, head at 6", .rows = 6, .head = 6 },
+        .{ .name = "6 rows, head at 128", .rows = 6, .head = null },
+    };
+    for (shapes) |sh| {
+        var times: [7]f64 = undefined;
+        for (&times) |*tm| {
+            m.history.items.len = from;
+            const t0 = std.Io.Clock.awake.now(c.io);
+            try m.passRows(ids[0..sh.rows], c.logits, .{ .at = 0, .out = out[0 .. sh.rows * V], .head = sh.head });
+            tm.* = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(c.io)).toNanoseconds())) / 1e6;
+        }
+        std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+        std.debug.print("  {s:<38} {d:8.2} ms ({d:6.2} ms a row)\n", .{ sh.name, times[3], times[3] / @as(f64, @floatFromInt(sh.rows)) });
+    }
+    m.history.items.len = from;
+}
+
+/// One row's four streams after every layer, the same row fed alone and inside a six-row window: the first layer
+/// whose output moves is the kernel that depends on the pass's row count, and the trunk's rest cannot be blamed.
+fn traceLayers(a: std.mem.Allocator, c: *family.Cuda, from: usize, first: u32) !void {
+    const geom = @import("cuda_scratch.zig");
+    const m = c.m;
+    const V: usize = m.text.vocab_size;
+    const row_bytes = geom.S * geom.H * 2; // four streams of BF16 hidden
+    const layers = m.layers.len;
+    const geom_k = @import("cuda_scratch.zig").K;
+    const geom_e = @import("cuda_scratch.zig").E;
+    var buf = try cuda.DeviceBuffer.alloc(m.d, layers * row_bytes);
+    defer buf.free();
+    var picks = try cuda.DeviceBuffer.alloc(m.d, layers * geom_k * 4);
+    defer picks.free();
+    var scores = try cuda.DeviceBuffer.alloc(m.d, layers * geom_e * 4);
+    defer scores.free();
+    const alone_picks = try a.alloc(u8, layers * geom_k * 4);
+    const window_picks = try a.alloc(u8, layers * geom_k * 4);
+    const alone_scores = try a.alloc(u8, layers * geom_e * 4);
+    const window_scores = try a.alloc(u8, layers * geom_e * 4);
+    const alone = try a.alloc(u8, layers * row_bytes);
+    const window = try a.alloc(u8, layers * row_bytes);
+    var ids: [dfly.width]u32 = @splat(0);
+    for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
+    ids[0] = first;
+    const out = try a.alloc(f32, dfly.width * V);
+    m.history.items.len = from;
+    m.trace = .{ .row = 0, .buf = buf, .picks = picks, .scores = scores };
+    defer m.trace = null;
+    try c.pass(ids[0..1]);
+    try buf.downloadAsync(0, alone, m.s.handle);
+    try picks.downloadAsync(0, alone_picks, m.s.handle);
+    try scores.downloadAsync(0, alone_scores, m.s.handle);
+    try m.s.synchronize();
+    m.history.items.len = from;
+    try m.passRows(ids[0..], c.logits, .{ .at = 0, .out = out[0 .. dfly.width * V], .head = dfly.width });
+    try buf.downloadAsync(0, window, m.s.handle);
+    try picks.downloadAsync(0, window_picks, m.s.handle);
+    try scores.downloadAsync(0, window_scores, m.s.handle);
+    try m.s.synchronize();
+    m.history.items.len = from;
+    std.debug.print("row 0's hidden after every layer, one row alone against the same row in a {d}-row pass:\n", .{dfly.width});
+    std.debug.print("  layer   relative RMS   max |delta|   (row alone's RMS)\n", .{});
+    for (0..layers) |l| {
+        const x = alone[l * row_bytes ..][0..row_bytes];
+        const y = window[l * row_bytes ..][0..row_bytes];
+        var diff: f64 = 0;
+        var base: f64 = 0;
+        var most: f32 = 0;
+        var i: usize = 0;
+        while (i < geom.S * geom.H) : (i += 1) {
+            const u = widenHalf(x, i);
+            const v = widenHalf(y, i);
+            const d = u - v;
+            diff += @as(f64, d) * d;
+            base += @as(f64, v) * v;
+            most = @max(most, @abs(d));
+        }
+        std.debug.print("  {d:>5} {d:13.5} {d:12.5} {d:16.5}\n", .{ l, @sqrt(diff / base), most, @sqrt(base / @as(f64, geom.S * geom.H)) });
+    }
+    // The routed half is the one discrete decision a row makes: an expert set that differs is a different row.
+    std.debug.print("row 0's router picks, one row alone against the same row in a {d}-row pass:\n", .{dfly.width});
+    var differs: usize = 0;
+    for (0..layers) |l| {
+        var apart: usize = 0;
+        var gap_alone: f32 = 0;
+        var gap_window: f32 = 0;
+        for (0..geom_k) |k| {
+            const u = std.mem.readInt(u32, alone_picks[(l * geom_k + k) * 4 ..][0..4], .little);
+            const v = std.mem.readInt(u32, window_picks[(l * geom_k + k) * 4 ..][0..4], .little);
+            if (u != v) apart += 1;
+        }
+        if (apart == 0) continue;
+        differs += 1;
+        // How close the two arms' own scores were: a tie is a rounding difference, a gap is a wrong read.
+        for (0..geom_k) |k| {
+            const u = std.mem.readInt(u32, alone_picks[(l * geom_k + k) * 4 ..][0..4], .little);
+            const v = std.mem.readInt(u32, window_picks[(l * geom_k + k) * 4 ..][0..4], .little);
+            const su = readF32(alone_scores, l * geom_e + u);
+            const sv = readF32(window_scores, l * geom_e + v);
+            gap_alone = @max(gap_alone, @abs(su - readF32(alone_scores, l * geom_e + v)));
+            gap_window = @max(gap_window, @abs(sv - readF32(window_scores, l * geom_e + u)));
+        }
+        std.debug.print("  layer {d:>2}: {d} of {d} picks differ; |score(chosen) - score(other)| {d:.6} alone, {d:.6} in the window\n", .{ l, apart, geom_k, gap_alone, gap_window });
+    }
+    std.debug.print("  {d} of {d} routed layers pick a different expert set at row 0\n", .{ differs, layers });
+}
+
+fn readF32(bytes: []const u8, i: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, bytes[4 * i ..][0..4], .little));
+}
+
+fn widenHalf(bytes: []const u8, i: usize) f32 {
+    return @bitCast(@as(u32, std.mem.readInt(u16, bytes[2 * i ..][0..2], .little)) << 16);
+}
+
+/// The same rows two ways: `positions` rows of one greedy stream fed a row at a time, then the same tokens in
+/// one window of `width` rows, row against row. Per row: KL(window || single), top-1 agreement and |delta|.
+/// A window that reshapes the trunk shows up here and nowhere else; the harness's rounds hide it in acceptance.
+fn measureRows(a: std.mem.Allocator, c: *family.Cuda, from: usize, positions: usize, first: u32, trace: bool) !void {
+    const m = c.m;
+    const V: usize = m.text.vocab_size;
+    const single = try a.alloc(f32, dfly.width * V);
+    const block = try a.alloc(f32, dfly.width * V);
+    const ids = try a.alloc(u32, dfly.width);
+    // What a row costs by shape. The plain path's head runs `geom.head_block` rows whatever the pass holds;
+    // a window runs its own width. Same logits either way (the head at 6 rows is bit-identical at 128).
+    try timeShapes(a, c, from);
+    if (trace) try traceLayers(a, c, from, first);
+    std.debug.print("row count: {d} rows a width from position {d}, KL(window || one at a time)\n", .{ positions, from });
+    for ([_]usize{ 6, 4, 2 }) |width| {
+        if (width > dfly.width) continue;
+        m.history.items.len = from;
+        // The stream's first token is the prompt's own draw; each arm re-derives the rest from its own rows, so
+        // the tokens are the one-row arm's and both arms see them.
+        var next: u32 = first;
+        var kl_all: [dfly.width][most_blocks]f64 = @splat(@splat(0));
+        var kl_most: [dfly.width]f64 = @splat(0);
+        var worst: [dfly.width]f32 = @splat(0);
+        var apart: [dfly.width]f32 = @splat(0);
+        var miss: [dfly.width]usize = @splat(0);
+        var control: f32 = 0; // the same one-row pass twice: what this box's own arithmetic does
+        var blocks: usize = 0;
+        while (blocks * width < positions) : (blocks += 1) {
+            const at = m.history.items.len;
+            if (at + width > m.capacity) break;
+            for (0..width) |r| {
+                ids[r] = next;
+                const only = [1]u32{next};
+                try c.pass(&only);
+                @memcpy(single[r * V ..][0..V], c.logits);
+                next = argmax(c.logits);
+            }
+            m.history.items.len = at;
+            try m.passRows(ids[0..width], c.logits, .{ .at = 0, .out = block[0 .. width * V], .head = width });
+            m.history.items.len = at + width;
+            if (blocks == 0) { // a control: row 0 fed alone twice, which must be the same numbers
+                m.history.items.len = at;
+                const again = try a.alloc(f32, V);
+                defer a.free(again);
+                const only = [1]u32{ids[0]};
+                try m.passRows(&only, c.logits, .{ .at = 0, .out = again, .head = 1 });
+                control = maxDiff(single[0..V], again);
+                m.history.items.len = at + width;
+            }
+            for (0..width) |r| {
+                const kl = divergence(block[r * V ..][0..V], single[r * V ..][0..V]);
+                if (blocks < most_blocks) kl_all[r][blocks] = kl;
+                kl_most[r] = @max(kl_most[r], kl);
+                var most: f32 = 0;
+                var total: f32 = 0;
+                for (block[r * V ..][0..V], single[r * V ..][0..V]) |x, y| {
+                    most = @max(most, @abs(x - y));
+                    total += @abs(x - y);
+                }
+                worst[r] = @max(worst[r], most);
+                apart[r] = @max(apart[r], total / @as(f32, @floatFromInt(V)));
+                miss[r] += @intFromBool(argmax(block[r * V ..][0..V]) != argmax(single[r * V ..][0..V]));
+            }
+        }
+        if (blocks == 0) continue;
+        std.debug.print("  width {d}: {d} blocks ({d} rows), the same row alone twice: max |d| {d:.2}\n", .{ width, blocks, blocks * width, control });
+        std.debug.print("    row  median KL    p90 KL   max KL   over 0.05   top-1 miss   max |d|   mean |d|\n", .{});
+        for (0..width) |r| {
+            const n = @min(blocks, most_blocks);
+            std.mem.sort(f64, kl_all[r][0..n], {}, std.sort.asc(f64));
+            const median = if (n == 0) 0 else kl_all[r][n / 2];
+            const p90 = if (n == 0) 0 else kl_all[r][@min(n - 1, (n * 9) / 10)];
+            var over: usize = 0;
+            for (kl_all[r][0..n]) |v| over += @intFromBool(v > 0.05);
+            std.debug.print("  {d:>5} {d:9.5} {d:9.5} {d:8.5} {d:9} of {d:<3} {d:7} of {d:<3} {d:8.4} {d:9.5}\n", .{
+                r, median, p90, kl_most[r], over, n, miss[r], n, worst[r], apart[r],
+            });
+        }
+    }
+}
+
+/// KL(a || b) over one row of FP32 logits, nats.
+fn divergence(a: []const f32, b: []const f32) f64 {
+    var la: f64 = -std.math.inf(f64);
+    var lb: f64 = -std.math.inf(f64);
+    for (a) |v| la = @max(la, v);
+    for (b) |v| lb = @max(lb, v);
+    var za: f64 = 0;
+    var zb: f64 = 0;
+    for (a, b) |x, y| {
+        za += @exp(@as(f64, x) - la);
+        zb += @exp(@as(f64, y) - lb);
+    }
+    const na = la + @log(za);
+    const nb = lb + @log(zb);
+    var kl: f64 = 0;
+    for (a, b) |x, y| {
+        const lg = @as(f64, x) - na;
+        kl += @exp(lg) * (lg - (@as(f64, y) - nb));
+    }
+    return @max(kl, 0);
 }
 
 fn argmax(l: []const f32) u32 {
