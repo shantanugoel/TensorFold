@@ -182,18 +182,19 @@ pub const Model = struct {
         const s = self.s;
         const k = self.k;
         const eps = self.text.rms_norm_eps;
+        const pass_a = std.heap.page_allocator; // a pass's own buffers are freed a pass; `a` keeps them a process
         // Embedding into four identical streams.
         var x = sc.streams[0].ptr;
         for (tokens, 0..) |tok, r| for (0..S) |st| {
             try sc.streams[0].copyFrom((r * S + st) * H * 2, self.embed + @as(u64, tok) * H * 2, H * 2, s.handle);
         };
         // Positions (text: t = h = w), write slots and key lists for both attention kinds.
-        const positions = try self.a.alloc(i32, rows * 3);
-        defer self.a.free(positions);
-        const writes = try self.a.alloc(u32, rows);
-        defer self.a.free(writes);
-        const ring_writes = try self.a.alloc(u32, rows);
-        defer self.a.free(ring_writes);
+        const positions = try pass_a.alloc(i32, rows * 3);
+        defer pass_a.free(positions);
+        const writes = try pass_a.alloc(u32, rows);
+        defer pass_a.free(writes);
+        const ring_writes = try pass_a.alloc(u32, rows);
+        defer pass_a.free(ring_writes);
         for (0..rows) |r| {
             const p: i32 = @intCast(start + r);
             positions[r * 3 ..][0..3].* = .{ p, p, p };
@@ -206,14 +207,14 @@ pub const Model = struct {
         try sc.write_ring.uploadAsync(0, std.mem.sliceAsBytes(ring_writes), s.handle);
         // Past the budget an indexed row's list comes from the layer's indexer, so nothing is built here.
         const lists = self.capacity > sparse_stride and start + rows - 1 >= sparse_stride;
-        const keys_sparse = try self.a.alloc(u32, if (lists) 0 else rows * sparse_stride);
-        defer self.a.free(keys_sparse);
-        const keys_sliding = try self.a.alloc(u32, rows * sliding_stride);
-        defer self.a.free(keys_sliding);
-        const counts_sparse = try self.a.alloc(u32, rows);
-        defer self.a.free(counts_sparse);
-        const counts_sliding = try self.a.alloc(u32, rows);
-        defer self.a.free(counts_sliding);
+        const keys_sparse = try pass_a.alloc(u32, if (lists) 0 else rows * sparse_stride);
+        defer pass_a.free(keys_sparse);
+        const keys_sliding = try pass_a.alloc(u32, rows * sliding_stride);
+        defer pass_a.free(keys_sliding);
+        const counts_sparse = try pass_a.alloc(u32, rows);
+        defer pass_a.free(counts_sparse);
+        const counts_sliding = try pass_a.alloc(u32, rows);
+        defer pass_a.free(counts_sliding);
         @memset(keys_sparse, 0);
         @memset(keys_sliding, 0);
         for (0..rows) |r| {
@@ -227,15 +228,15 @@ pub const Model = struct {
             for (first..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(if (self.ring) geom.ring.slot(j) else j);
         }
         // Engram rows for the whole pass: a row hashes from the token ids alone, so all four tables start at once.
-        const windows = try self.a.alloc([engram.order]u32, rows);
-        defer self.a.free(windows);
+        const windows = try pass_a.alloc([engram.order]u32, rows);
+        defer pass_a.free(windows);
         const pad = self.text.engram_pad_id;
         for (windows, 0..) |*w, r| {
             const pos = start + r;
             for (w, 0..) |*v, back| v.* = if (pos >= back) self.history.items[pos - back] else pad;
         }
         const et0 = std.Io.Clock.awake.now(self.io);
-        var gathers = try engram_pass.Rows.start(self.a, self.io, self.engrams, windows, engram_cuda.input, engram_readers);
+        var gathers = try engram_pass.Rows.start(pass_a, self.io, self.engrams, windows, engram_cuda.input, engram_readers);
         defer gathers.close(self.io);
         self.engram_ns += et0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
 
@@ -343,25 +344,38 @@ pub const Model = struct {
             slot = (slot + 1) % 3;
             x = after_ff;
         }
-        // Hyper head, final norm and LM head: the last row alone, and every row when a scoring pass asks.
+        // Hyper head, final norm and LM head over the rows the caller keeps, a head block at a time.
+        const V: usize = self.text.vocab_size;
+        var held = false; // the caller's range covers the pass's last row, so its logits come from there
         if (rows_out) |want| {
-            const V: usize = self.text.vocab_size;
             const count = want.out.len / V;
-            if (want.out.len != count * V or want.at + count > rows) return error.BadHy4PassRows;
-            for (0..count) |r| try self.headRow(s, x, want.at + r, want.out[r * V ..][0..V]);
+            if (want.out.len != count * V or count == 0 or want.at + count > rows) return error.BadHy4PassRows;
+            try self.headRows(s, x, want.at, count, want.out);
+            if (want.at + count == rows) {
+                @memcpy(logits_out[0..V], want.out[(rows - 1 - want.at) * V ..][0..V]);
+                held = true;
+            }
         }
-        try self.headRow(s, x, rows - 1, logits_out);
+        if (!held) try self.headRows(s, x, rows - 1, 1, logits_out);
     }
 
-    /// Row `row` of the pass's final streams through the hyper head, final norm and LM head, down to `out`.
-    fn headRow(self: *Model, s: cuda.Stream, x: u64, row: usize, out: []f32) !void {
+    /// `count` pass rows from `at` through the hyper head, the final norm and the LM head, whole blocks only.
+    fn headRows(self: *Model, s: cuda.Stream, x: u64, at: usize, count: usize, out: []f32) !void {
         const sc = self.scratch;
         const k = self.k;
-        const hidden = x + row * S * H * 2;
-        try k.ihc.collapse(s, .{ .hidden = hidden, .projection = self.head_hc.project, .bias = self.head_hc.bias, .scale = self.head_hc.scale, .output = sc.head_hidden, .post = 0 }, self.hcShape(1, S));
-        try k.norms.addRmsTail(s, sc.head_hidden, null, self.final_norm, sc.norm_tmp, sc.head_norm, null, 1, H, self.text.rms_norm_eps, .{ .round = true });
-        try self.project(s, self.lm_head, sc.head_norm, 1, sc.lm_logits, .f32);
+        const V: usize = self.text.vocab_size;
+        if (out.len != count * V or at + count > self.max_rows) return error.BadHy4PassRows;
+        const logits: cuda.DeviceBuffer = .{ .d = self.d, .ptr = sc.lm_logits, .len = geom.head_block * V * 4, .borrowed = true };
+        var done: usize = 0;
+        while (done < count) : (done += geom.head_block) {
+            const keep = @min(count - done, geom.head_block);
+            const hidden = x + (at + done) * S * H * 2;
+            const block = self.hcShape(geom.head_block, S);
+            try k.ihc.collapse(s, .{ .hidden = hidden, .projection = self.head_hc.project, .bias = self.head_hc.bias, .scale = self.head_hc.scale, .output = sc.head_hidden, .post = 0 }, block);
+            try k.norms.addRmsTail(s, sc.head_hidden, null, self.final_norm, sc.norm_tmp, sc.head_norm, null, geom.head_block, H, self.text.rms_norm_eps, .{ .round = true });
+            try self.project(s, self.lm_head, sc.head_norm, geom.head_block, sc.lm_logits, .f32);
+            try logits.downloadAsync(0, std.mem.sliceAsBytes(out[done * V ..][0 .. keep * V]), s.handle);
+        }
         try s.synchronize();
-        try cuda.memory.download(self.d, sc.lm_logits, std.mem.sliceAsBytes(out));
     }
 };
