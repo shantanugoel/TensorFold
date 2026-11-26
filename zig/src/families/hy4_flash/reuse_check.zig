@@ -28,11 +28,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{usage});
         return error.BadArgs;
     }
-    const dir = args[2];
-    const prompt_ids = try readIds(a, io, args[3]);
-    const capacity = try std.fmt.parseInt(usize, args[4], 10);
-    const from = try std.fmt.parseInt(usize, args[5], 10);
-    const tokens: usize = if (args.len > 6) try std.fmt.parseInt(usize, args[6], 10) else 8;
+    const dir = args[1];
+    const prompt_ids = try readIds(a, io, args[2]);
+    const capacity = try std.fmt.parseInt(usize, args[3], 10);
+    const from = try std.fmt.parseInt(usize, args[4], 10);
+    const tokens: usize = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 8;
     if (from == 0 or from >= prompt_ids.len or from % 4 == 0) return error.BadReuseRow;
     if (capacity <= prompt_ids.len + tokens) return error.BadArgs;
 
