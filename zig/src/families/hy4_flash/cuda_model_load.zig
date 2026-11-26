@@ -15,6 +15,7 @@ const direct = @import("bf16_rows.zig");
 const geom = @import("cuda_scratch.zig");
 const cuda_index = @import("cuda_index.zig");
 const model = @import("cuda_model.zig");
+const dfly = @import("cuda_draft.zig");
 
 const Model = model.Model;
 const Layer = model.Layer;
@@ -129,8 +130,15 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         seen += 1;
     };
     self.engrams = engrams;
+    // DFly2's tower: the pack's `model.dfly_layers.*`, on the device only when a round holds drafts.
+    if (o.drafts > 0) {
+        self.draft = try dfly.load(a, &self.own, d, ck, cfg.value);
+        ck.release();
+        const dr = self.draft.?;
+        std.debug.print("DFly2 drafter: {d} layers of {d}, a block of {d} rows\n", .{ dr.layers.len, dr.inner, dfly.width });
+    }
     // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor
-    try @import("loader.zig").finishCuda(ck, cfg.value);
+    try @import("loader.zig").finishCuda(ck, cfg.value, self.draft != null);
     std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
     self.weight_bytes = self.own.bytes;
     // The indexer's GEMMs keep one row width whatever a pass takes, so it reads that many rows of the model's scratch.

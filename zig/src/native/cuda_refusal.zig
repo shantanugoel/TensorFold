@@ -5,6 +5,7 @@ const nemotron = @import("nemotron");
 const qwen35 = @import("qwen35");
 pub const deepseek_release_message = "DeepSeek-V4.1 is not served by this release's CUDA server; its whole-model gate is #827";
 const glm_model_type = "glm5_next"; // GLM-5.3-Flash's (glm.cuda_native.model_type): its Options take mtp_confidence
+const hy4_model_type = "hy_v4_flash"; // Hy4-flash's: its DFly2 block is the checkpoint's, and its own open bounds it
 
 /// The first Thor product serves Qwen3.8-27B text with DFlash2 on one GPU.
 pub fn sm110Product(a: std.mem.Allocator, io: std.Io, o: api.Open, moss_image: bool, problem: *[]const u8) !bool {
@@ -41,6 +42,8 @@ pub fn backend(o: api.Open) ?[]const u8 {
         if (qwen_mtp) {
             const max = @import("qwen35").native.max_mtp_drafts;
             if (n > max) return std.fmt.comptimePrint("--mtp-drafts: Qwen CUDA drafts at most {d}", .{max});
+        } else if (std.mem.eql(u8, o.model_type, hy4_model_type)) {
+            // Hy4-flash's block width is the family's (serve_cuda.drafts), and its open says why past it.
         } else if (n > nemotron.native.max_drafts) {
             return std.fmt.comptimePrint("--mtp-drafts: the CUDA engine drafts at most {d}", .{nemotron.native.max_drafts});
         }
@@ -51,7 +54,8 @@ pub fn backend(o: api.Open) ?[]const u8 {
         if (o.mtp_confidence != null and o.drafter != null) return "--mtp-confidence stops the MTP head's chains, and with --drafter DFlash2 drafts instead: serve without one of them";
     } else if (o.mtp_drafts != null or o.mtp_confidence != null) {
         if (qwen_mtp and o.mtp_confidence != null) return "--mtp-confidence is not supported by the Qwen CUDA MTP head";
-        if (!qwen_mtp and !std.mem.eql(u8, o.model_type, nemotron.native.model_type) and
+        if (!qwen_mtp and !std.mem.eql(u8, o.model_type, hy4_model_type) and
+            !std.mem.eql(u8, o.model_type, nemotron.native.model_type) and
             !std.mem.eql(u8, o.model_type, nemotron.omni.model_type) and !std.mem.eql(u8, o.model_type, nemotron.transcribe.model_type))
             return "--mtp-drafts: this CUDA family's drafts are not tunable; serve it without --mtp-drafts or --mtp-confidence";
     }
@@ -77,6 +81,9 @@ test "Nemotron 3.5 Transcribe takes --mtp-drafts and --mtp-confidence as the oth
     // a family whose drafts are not tunable still refuses each flag by name
     const fixed = "--mtp-drafts: this CUDA family's drafts are not tunable; serve it without --mtp-drafts or --mtp-confidence";
     try std.testing.expectEqualStrings(fixed, backend(.{ .dir = "d", .model_type = "lfm2", .mtp_drafts = 2 }).?);
+    // Hy4-flash's DFly2 block is the family's own knob: its open refuses a width past the checkpoint's
+    try std.testing.expect(backend(.{ .dir = "d", .model_type = hy4_model_type, .mtp_drafts = 5 }) == null);
+    try std.testing.expect(backend(.{ .dir = "d", .model_type = hy4_model_type, .mtp_drafts = 0 }) == null);
     try std.testing.expectEqualStrings(fixed, backend(.{ .dir = "d", .model_type = "lfm2", .mtp_confidence = 0.5 }).?);
 }
 

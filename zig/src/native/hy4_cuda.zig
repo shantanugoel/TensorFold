@@ -104,7 +104,8 @@ fn refusal(a: Allocator, o: api.Open) !?[]const u8 {
     if (o.lanes > 1) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves one sequence at a time and queues the rest; serve with --parallel 1 (batching is plan step 7.6's follow-on)", .{o.lanes});
     if (o.tp != 1 or o.rank != 0) return try std.fmt.allocPrint(a, "--tp {d} --rank {d}: the native Hy4-flash engine is one device (1 and 0)", .{ o.tp, o.rank });
     if (o.kv8) return try std.fmt.allocPrint(a, "--kv-cache fp8: this engine's caches are BF16; 8-bit KV is plan step 7.7", .{});
-    if (o.drafter != null or o.mtp_drafts != null or o.mtp_confidence != null) return try std.fmt.allocPrint(a, "--drafter and --mtp-*: the DFly2 drafter on CUDA is plan step 7.8, so serve without a draft head", .{});
+    if (o.drafter != null or o.mtp_confidence != null) return try std.fmt.allocPrint(a, "--drafter and --mtp-confidence: DFly2 is the pack's own component, so --mtp-drafts {d} names its drafts and no separate checkpoint or confidence head is served", .{family.drafts});
+    if ((o.mtp_drafts orelse 0) > family.drafts) return try std.fmt.allocPrint(a, "--mtp-drafts {d}: DFly2 proposes {d} drafts a round at most", .{ o.mtp_drafts.?, family.drafts });
     if (o.slide) return try std.fmt.allocPrint(a, "--slide: Hy4-flash does not learn on CUDA; serve without --slide", .{});
     if (o.learn != null or o.learn_conversations) return try std.fmt.allocPrint(a, "--learn and --learn-conversations: the native Hy4-flash engine keeps no learned states; serve without them", .{});
     if (o.recall or o.record != null) return try std.fmt.allocPrint(a, "--recall and --record: the native Hy4-flash engine has neither to offer yet", .{});
@@ -161,22 +162,24 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer h.s.deinit();
     h.k = family.Kernels.load(gpa, &h.driver) catch |e| return refuse(a, problem, "the native Hy4-flash kernel images cannot load ({s})", .{@errorName(e)});
     errdefer h.k.deinit();
-    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
+    const drafts = o.mtp_drafts orelse 0;
+    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
     const bytes = h.c.bytes();
     const avail = family.memAvailable();
     if (avail < floor_gib << 30) return refuse(a, problem, "{s}", .{try floorRefusal(a, capacity, family.bytesPerToken(h.c.m), avail, floor_gib)});
-    h.cfg = try lanes.Config.init(gpa, family.Cuda.facts(), family.max_window, 0);
+    h.cfg = try lanes.Config.init(gpa, family.Cuda.facts(h.c), family.max_window, family.max_window - 1);
     errdefer h.cfg.deinit(gpa);
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.c.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.startup = try std.fmt.allocPrint(gpa, "CUDA device {d}: Hy4-flash {d}-token context ({d:.2} GiB KV + {d:.2} GiB indexer keys + {d:.0} MiB ring + {d:.0} MiB recall scores), {d:.2} GiB weights, {d:.1} GiB free after the load, one sequence", .{
+    h.startup = try std.fmt.allocPrint(gpa, "CUDA device {d}: Hy4-flash {d}-token context ({d:.2} GiB KV + {d:.2} GiB indexer keys + {d:.0} MiB ring + {d:.0} MiB recall scores), {d:.2} GiB weights, {d:.1} GiB free after the load, one sequence, DFly2 {s}", .{
         device,                       capacity,
         gib(bytes.kv),                gib(bytes.index),
         @as(f64, @floatFromInt(bytes.ring)) / (1 << 20), @as(f64, @floatFromInt(bytes.scores)) / (1 << 20),
         gib(h.c.m.weight_bytes),      gib(avail),
+        if (h.c.m.draft != null) "on" else "off",
     });
     errdefer gpa.free(h.startup);
     h.host = api.LaneHost.init(gpa, io, &h.core, .{

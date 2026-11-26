@@ -16,6 +16,7 @@ const direct = @import("bf16_rows.zig");
 const engram_pass = @import("engram_pass.zig");
 const geom = @import("cuda_scratch.zig");
 const cuda_index = @import("cuda_index.zig");
+const dfly = @import("cuda_draft.zig");
 
 const H = geom.H;
 const S = geom.S;
@@ -162,12 +163,16 @@ pub const Model = struct {
     engrams: []*const direct.Table = &.{},
     /// Host nanoseconds a pass spent on the Engram rows: planning, reading and waiting.
     engram_ns: i96 = 0,
+    /// The pack's DFly2 drafter, when a round holds drafts: `cuda_draft.zig`, and null on the one-row path.
+    draft: ?dfly.Draft = null,
 
-    /// What one load takes: the context's rows, the widest pass, and whether sliding layers keep a ring.
+    /// What one load takes: the context's rows, the widest pass, whether sliding layers keep a ring, and the
+    /// drafts a round holds (0: no DFly2 drafter, which is the only shape a one-row window has).
     pub const Options = struct {
         capacity: usize,
         max_rows: usize,
         ring: bool = true,
+        drafts: u32 = 0,
     };
 
     fn hcShape(self: *const Model, rows: usize, gates: u32) ihc.Shape {
@@ -175,7 +180,7 @@ pub const Model = struct {
     }
 
     /// One projection's rows: the pack's EXL3 group through the dense kernels, or its BF16 weight through cuBLAS.
-    fn project(self: *Model, s: cuda.Stream, p: dense.Projection, x: u64, rows: usize, y: u64, out: cuda.cublaslt.DataType) !void {
+    pub fn project(self: *Model, s: cuda.Stream, p: dense.Projection, x: u64, rows: usize, y: u64, out: cuda.cublaslt.DataType) !void {
         switch (p.weight) {
             .bf16 => |w| try self.k.gemm.run(s, x, w, y, rows, p.n, p.k, out),
             .exl3 => |w| try self.k.dense.prompt(s, w, x, .bf16, rows, y, switch (out) {
@@ -187,7 +192,8 @@ pub const Model = struct {
     }
 
     /// Which pass rows to hand back: `out` holds one `vocab`-wide FP32 row a pass row from `at` on.
-    pub const Rows = struct { at: usize, out: []f32 };
+    /// `head`: rows the hyper head, the final norm and the LM head run at once (null: the LM head's own block).
+    pub const Rows = struct { at: usize, out: []f32, head: ?usize = null };
 
     /// Run `tokens` (appended at the current history length) through the model; returns the last row's logits.
     pub fn pass(self: *Model, tokens: []const u32, logits_out: []f32) !void {
@@ -262,9 +268,16 @@ pub const Model = struct {
         defer gathers.close(self.io);
         self.engram_ns += et0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
 
+        // DFly2 reads the last kept row's hidden state and its five target layers' recalled lists.
+        if (self.draft) |*dr| {
+            const cap = &dr.scratch;
+            cap.selected = lists;
+            cap.rows = if (rows <= dfly.width) rows else 1;
+            cap.anchor = if (rows <= dfly.width) rows - 1 else 0;
+        }
         const rope_sparse = try self.text.rotary(.deepseek_sparse_attention);
         var slot: usize = 0; // index of the stream buffer x lives in
-        for (self.layers) |*layer| {
+        for (self.layers, 0..) |*layer, layer_index| {
             // Engram residual into the streams.
             if (layer.engram) |*e| {
                 const et = std.Io.Clock.awake.now(self.io);
@@ -307,6 +320,8 @@ pub const Model = struct {
             } else if (!lists) {
                 try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(keys_sparse), s.handle);
                 try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(counts_sparse), s.handle);
+            } else if (self.draft) |*dr| {
+                try self.capture(dr, layer_index, rows);
             }
             const shape = try attn.Shape.init(@intCast(rows), at.heads, @intCast(stride));
             try mla.forward(k.project, k.attention, s, .{
@@ -372,17 +387,30 @@ pub const Model = struct {
         if (rows_out) |want| {
             const count = want.out.len / V;
             if (want.out.len != count * V or count == 0 or want.at + count > rows) return error.BadHy4PassRows;
-            try self.headRows(s, x, want.at, count, want.out);
+            try self.headRows(s, x, want.at, count, want.out, want.head orelse geom.head_block);
             if (want.at + count == rows) {
-                @memcpy(logits_out[0..V], want.out[(rows - 1 - want.at) * V ..][0..V]);
+                // The caller's range covers the pass's last row, so `logits_out` takes that row too — unless it
+                // is that same storage: a verify window asks for every row and reads them all from `want.out`,
+                // and a copy from the last row over the first would hand every draw the wrong row's logits.
+                const last = want.out[(rows - 1 - want.at) * V ..][0..V];
+                if (!inside(want.out, logits_out)) @memcpy(logits_out[0..V], last);
                 held = true;
             }
         }
-        if (!held) try self.headRows(s, x, rows - 1, 1, logits_out);
+        if (!held) try self.headRows(s, x, rows - 1, 1, logits_out, geom.head_block);
     }
 
-    /// The caches, the pass's scratch, the Engram tables and the weights, released before the context is.
+    /// Whether `part` lies wholly inside `whole`: a verify window's rows are one buffer, and writing the last row
+/// over the first (as the `logits_out` convenience does) would hand every draw the wrong row's logits.
+fn inside(whole: []const f32, part: []const f32) bool {
+    const start = @intFromPtr(whole.ptr);
+    const at = @intFromPtr(part.ptr);
+    return at >= start and at + part.len * @sizeOf(f32) <= start + whole.len * @sizeOf(f32);
+}
+
+/// The caches, the pass's scratch, the Engram tables and the weights, released before the context is.
     pub fn free(self: *Model) void {
+        if (self.draft) |*dr| dfly.free(self.a, dr);
         for (self.layers) |*layer| {
             layer.attention.cache.free();
             if (layer.attention.index) |ix| {
@@ -407,21 +435,35 @@ pub const Model = struct {
         a.destroy(self);
     }
 
-    /// `count` pass rows from `at` through the hyper head, the final norm and the LM head, whole blocks only.
-    fn headRows(self: *Model, s: cuda.Stream, x: u64, at: usize, count: usize, out: []f32) !void {
+    /// A draft layer's share of a pass: its target layer's recall lists for the rows a later proposal reads.
+    /// A pass wider than a proposal block (a prompt chunk) keeps only its last row, the only one a draft reads.
+    fn capture(self: *Model, dr: *dfly.Draft, layer: usize, rows: usize) !void {
+        const whole = rows <= dfly.width;
+        const at = if (whole) 0 else rows - 1;
+        const keep = if (whole) rows else 1;
+        for (dr.layers, 0..) |l, i| {
+            if (l.target_index != layer) continue;
+            try dr.scratch.lists[i].copyFrom(0, self.scratch.slots.ptr + at * sparse_stride * 4, keep * sparse_stride * 4, self.s.handle);
+            try dr.scratch.captured[i].copyFrom(0, self.scratch.counts.ptr + at * 4, keep * 4, self.s.handle);
+        }
+    }
+
+    /// `count` pass rows from `at` through the hyper head, the final norm and the LM head, `block` rows a call.
+    /// A verify window names its own row count, so a six-row pass costs six rows and not a whole head block.
+    fn headRows(self: *Model, s: cuda.Stream, x: u64, at: usize, count: usize, out: []f32, block: usize) !void {
         const sc = self.scratch;
         const k = self.k;
         const V: usize = self.text.vocab_size;
-        if (out.len != count * V or at + count > self.max_rows) return error.BadHy4PassRows;
+        if (out.len != count * V or at + count > self.max_rows or block == 0 or block > geom.head_block) return error.BadHy4PassRows;
         const logits: cuda.DeviceBuffer = .{ .d = self.d, .ptr = sc.lm_logits, .len = geom.head_block * V * 4, .borrowed = true };
         var done: usize = 0;
-        while (done < count) : (done += geom.head_block) {
-            const keep = @min(count - done, geom.head_block);
+        while (done < count) : (done += block) {
+            const keep = @min(count - done, block);
             const hidden = x + (at + done) * S * H * 2;
-            const block = self.hcShape(geom.head_block, S);
-            try k.ihc.collapse(s, .{ .hidden = hidden, .projection = self.head_hc.project, .bias = self.head_hc.bias, .scale = self.head_hc.scale, .output = sc.head_hidden, .post = 0 }, block);
-            try k.norms.addRmsTail(s, sc.head_hidden, null, self.final_norm, sc.norm_tmp, sc.head_norm, null, geom.head_block, H, self.text.rms_norm_eps, .{ .round = true });
-            try self.project(s, self.lm_head, sc.head_norm, geom.head_block, sc.lm_logits, .f32);
+            const shape = self.hcShape(block, S);
+            try k.ihc.collapse(s, .{ .hidden = hidden, .projection = self.head_hc.project, .bias = self.head_hc.bias, .scale = self.head_hc.scale, .output = sc.head_hidden, .post = 0 }, shape);
+            try k.norms.addRmsTail(s, sc.head_hidden, null, self.final_norm, sc.norm_tmp, sc.head_norm, null, block, H, self.text.rms_norm_eps, .{ .round = true });
+            try self.project(s, self.lm_head, sc.head_norm, block, sc.lm_logits, .f32);
             try logits.downloadAsync(0, std.mem.sliceAsBytes(out[done * V ..][0 .. keep * V]), s.handle);
         }
         try s.synchronize();
