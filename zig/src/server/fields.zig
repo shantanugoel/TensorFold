@@ -8,6 +8,8 @@ const Allocator = std.mem.Allocator;
 
 pub const efforts = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max" };
 const effort_order = [_][]const u8{ "max", "xhigh", "high", "medium", "low", "minimal" }; // highest first
+/// A template's own thinking-off spellings, outside `effort_order`'s ladder.
+const off_efforts = [_][]const u8{"no_think"};
 
 /// Python's type name for ``'<type>' object has no attribute 'get'``.
 pub fn typeName(v: Value) []const u8 {
@@ -221,9 +223,10 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         effort = k.field("reasoning_effort");
     };
     if (effort) |e| {
-        if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
+        if (e != .string or !isEffort(e.string, levels)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
         out.effort = coerceEffort(e.string, levels);
-        out.enable = !std.mem.eql(u8, e.string, "none");
+        // a template's own off name (Hy4-flash's no_think) is thinking off, not a level
+        out.enable = !std.mem.eql(u8, e.string, "none") and !isOffEffort(e.string);
     }
     if (kw_object) if (enable) |on| {
         out.enable = on.truthy();
@@ -240,8 +243,14 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     return out;
 }
 
-fn isEffort(s: []const u8) bool {
+fn isEffort(s: []const u8, levels: []const []const u8) bool {
     for (efforts) |e| if (std.mem.eql(u8, e, s)) return true;
+    for (levels) |l| if (std.mem.eql(u8, l, s)) return true; // the template's own quoted names
+    return isOffEffort(s);
+}
+
+fn isOffEffort(name: []const u8) bool {
+    for (off_efforts) |o| if (std.mem.eql(u8, o, name)) return true;
     return false;
 }
 
@@ -282,19 +291,37 @@ pub fn coerceEffort(effort: []const u8, levels: []const []const u8) []const u8 {
 /// The efforts a chat template names in quotes (``effort_levels``).
 pub fn effortLevels(a: Allocator, template: []const u8) Allocator.Error![]const []const u8 {
     var found: std.ArrayList([]const u8) = .empty;
-    for (effort_order) |name| {
-        var at: usize = 0;
-        while (std.mem.indexOfPos(u8, template, at, name)) |i| : (at = i + 1) {
-            if (i == 0 or i + name.len >= template.len) continue;
-            const open = template[i - 1];
-            const close = template[i + name.len];
-            if ((open == '\'' or open == '"') and (close == '\'' or close == '"')) {
-                try found.append(a, name);
-                break;
-            }
-        }
-    }
+    for (effort_order) |name| if (quoted(template, name)) try found.append(a, name);
     return found.items;
+}
+
+/// The off switch a template names in quotes for its own thinking gate: Hy4-flash's ``no_think`` keys thinking on it
+/// alone, with no ``enable_thinking`` in the source at all. Null: the template names no such switch.
+pub fn offEffort(template: []const u8) ?[]const u8 {
+    for (off_efforts) |name| if (quoted(template, name)) return name;
+    return null;
+}
+
+/// ``name`` in ``template`` inside quotes: the templates' own spelling of an effort or a switch.
+fn quoted(template: []const u8, name: []const u8) bool {
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, template, at, name)) |i| : (at = i + 1) {
+        if (i == 0 or i + name.len >= template.len) continue;
+        const open = template[i - 1];
+        const close = template[i + name.len];
+        if ((open == '\'' or open == '"') and (close == '\'' or close == '"')) return true;
+    }
+    return false;
+}
+
+/// The effort a request names: its own ``reasoning_effort``, else ``chat_template_kwargs.reasoning_effort``, which a
+/// client sends the way Tabby's does (Hy4-flash keys thinking off on ``no_think``).
+pub fn requestedEffort(body: Value) ?[]const u8 {
+    if (body.field("reasoning_effort")) |e| if (e == .string) return e.string;
+    const kwargs = body.field("chat_template_kwargs") orelse return null;
+    if (kwargs != .object) return null;
+    if (kwargs.get("reasoning_effort")) |e| if (e == .string) return e.string;
+    return null;
 }
 
 /// Choices a request may ask for: each is its own engine request on the one prompt.
@@ -374,4 +401,23 @@ test "efforts and numbers" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("-12", (try pyIntText(arena.allocator(), " -0_12 ")).?);
     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
+}
+
+test "a template names its own off switch, and a request names its effort beside or inside the kwargs" {
+    const hy4 = "{%- elif reasoning_effort not in ['max', 'high', 'no_think'] %}";
+    try std.testing.expectEqualStrings("no_think", offEffort(hy4).?);
+    try std.testing.expect(offEffort("{% if enable_thinking %}") == null);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const levels = try effortLevels(a, hy4);
+    try std.testing.expectEqual(@as(usize, 2), levels.len);
+    const direct = (try json.parseText(a, "{\"reasoning_effort\":\"high\"}")).ok;
+    try std.testing.expectEqualStrings("high", requestedEffort(direct).?);
+    const kwargs = (try json.parseText(a, "{\"chat_template_kwargs\":{\"reasoning_effort\":\"no_think\"}}")).ok;
+    try std.testing.expectEqualStrings("no_think", requestedEffort(kwargs).?);
+    const both = (try json.parseText(a, "{\"reasoning_effort\":\"high\",\"chat_template_kwargs\":{\"reasoning_effort\":\"no_think\"}}")).ok;
+    try std.testing.expectEqualStrings("high", requestedEffort(both).?);
+    const none = (try json.parseText(a, "{\"chat_template_kwargs\":{\"enable_thinking\":false}}")).ok;
+    try std.testing.expect(requestedEffort(none) == null);
 }

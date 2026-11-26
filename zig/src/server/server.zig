@@ -158,6 +158,8 @@ pub const Server = struct {
         srv.recipients = recipient_reply.detect(text);
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
+        // a template that keys thinking off on its own name (Hy4-flash's no_think) hears it with thinking off
+        if (fields.offEffort(source)) |off| srv.off_effort = off;
         if (srv.recipients and srv.effort_levels.len > 0) srv.off_effort = fields.coerceEffort("minimal", srv.effort_levels);
         // Inkling 2's template has no enable_thinking: its off is reasoning_effort "none" (effort level 0)
         if (@import("chat_inkling2.zig").enabled(srv)) srv.off_effort = "none";

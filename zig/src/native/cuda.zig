@@ -171,6 +171,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     if (std.mem.eql(u8, o.model_type, "qwen3")) return @import("cuda_qwen3.zig").open(a, gpa, io, o, problem, budget, windows);
+    // Hy4-flash's own host: the step 1-3 text model, one sequence, no draft head or tower yet
+    if (std.mem.eql(u8, o.model_type, @import("hy4_cuda.zig").model_type)) return @import("hy4_cuda.zig").open(a, gpa, io, o, problem);
     switch (try open_family.special(a, gpa, io, o, problem)) {
         .not_mine => {},
         .opened => |engine| return engine,

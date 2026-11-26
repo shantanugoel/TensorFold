@@ -79,6 +79,10 @@ pub fn renderStarts(srv: *Server, cx: *Cx, messages: Value, tools: []const Value
             }
         }
     }
+    // A template that renders its own closed block (Hy4's no_think effort) ends on the close marker's token
+    if (!closed and generation and ids.len > 0) {
+        if (srv.close_id) |close| closed = ids[ids.len - 1] == close;
+    }
     if (require_off and !thinking and generation and srv.info.capability(.thinking_applicable) and !srv.thinking_switch and !closed)
         return cx.refuse("thinking off is not supported by this chat template: it has no thinking switch or closable generation prefix");
     return ids;

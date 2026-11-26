@@ -43,6 +43,23 @@ pub const Kernels = struct {
     engram: engram_cuda.Kernels,
     indexer: cuda_index.Kernels,
 
+    /// Every image and the shared EXL3 scratch, released before the context that made them.
+    pub fn deinit(self: *Kernels) void {
+        self.indexer.deinit();
+        self.engram.deinit();
+        self.router.unload();
+        self.glue.unload();
+        self.act.unload();
+        self.dense.unload();
+        self.experts.unload();
+        self.ihc.deinit();
+        self.attention.deinit();
+        self.project.deinit();
+        self.norms.unload();
+        self.gemm.deinit();
+        self.* = undefined;
+    }
+
     /// The kernel images embedded in this build (`-Dnvcc` or `-Dprebuilt`).
     pub fn load(a: std.mem.Allocator, d: *const cuda.Driver) !Kernels {
         return .{
@@ -357,6 +374,29 @@ pub const Model = struct {
             }
         }
         if (!held) try self.headRows(s, x, rows - 1, 1, logits_out);
+    }
+
+    /// The caches, the pass's scratch, the Engram tables and the weights, released before the context is.
+    pub fn free(self: *Model) void {
+        for (self.layers) |*layer| {
+            layer.attention.cache.free();
+            if (layer.attention.index) |ix| {
+                ix.token_keys.free();
+                ix.group_keys.free();
+                self.a.destroy(ix);
+            }
+            if (layer.engram) |*e| e.table.close();
+        }
+        var sc = self.scratch;
+        for (&sc.streams) |*b| b.free();
+        var owned = [_]cuda.DeviceBuffer{ sc.positions, sc.slots, sc.counts, sc.write_slots, sc.write_ring, sc.e_raw, self.index.recall_rows, self.index.scores, self.index.group_positions };
+        for (&owned) |*b| b.free();
+        self.own.deinit();
+        self.history.deinit(self.a);
+        const a = self.a;
+        a.free(self.engrams);
+        a.free(self.layers);
+        a.destroy(self);
     }
 
     /// `count` pass rows from `at` through the hyper head, the final norm and the LM head, whole blocks only.
