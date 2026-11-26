@@ -35,9 +35,16 @@ pub fn main(init: std.process.Init) !void {
     }
     if (chunk == 0 or chunk > 1024) return error.BadArgs;
     const prompt_bytes = try std.Io.Dir.cwd().readFileAlloc(io, args[2], a, .limited(1 << 20));
-    if (prompt_bytes.len < 4) return error.EmptyPrompt;
+    if (prompt_bytes.len < 4) {
+        std.debug.print("prompt {s} is empty: it holds no token ids\n", .{args[2]});
+        return error.EmptyPrompt;
+    }
     const prompt = try a.alloc(u32, prompt_bytes.len / 4);
     @memcpy(std.mem.sliceAsBytes(prompt), prompt_bytes[0 .. prompt.len * 4]);
+    if (score and prompt.len < 2) {
+        std.debug.print("--score needs two prompt tokens at least: a single token has no next token to score\n", .{});
+        return error.ShortPrompt;
+    }
     const new_tokens = try std.fmt.parseInt(usize, args[3], 10);
     try std.Io.Dir.cwd().createDirPath(io, args[4]);
     const out = try std.Io.Dir.cwd().openDir(io, args[4], .{});

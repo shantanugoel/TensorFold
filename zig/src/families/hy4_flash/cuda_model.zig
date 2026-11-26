@@ -238,20 +238,30 @@ pub const Model = struct {
         self.scratch = try geom.alloc(self.d, &self.own, self.max_rows, self.text.vocab_size);
         self.index = try cuda_index.Scratch.init(self.d, self.max_rows, self.capacity);
         try self.reserveDense();
-        // The pieces that grow with the context, so a size decision is read and not inferred.
+        // The pieces that grow with the context, so a size decision is read and not inferred: the KV, the indexer's
+        // two key caches (which grow with the context too and showed in no figure) and the recall scores.
         var kv_bytes: usize = 0;
+        var index_bytes: usize = 0;
         var sliding: usize = 0;
+        var indexers: usize = 0;
         for (self.layers) |layer| {
             kv_bytes += @as(usize, layer.attention.rows) * m.absorbed_stride * 2;
             sliding += @intFromBool(layer.attention.sliding);
+            if (layer.attention.index) |ix| {
+                index_bytes += ix.token_keys.len + ix.group_keys.len;
+                indexers += 1;
+            }
         }
-        std.debug.print("capacity {d}: KV {d:.2} GiB ({d} B a token over {d} indexed layers, {d} sliding at {d} rows), recall scores {d:.0} MiB\n", .{
+        std.debug.print("capacity {d}: KV {d:.2} GiB ({d} B a token over {d} indexed layers, {d} sliding at {d} rows), indexer keys {d:.2} GiB ({d} B a token over {d} layers), recall scores {d:.0} MiB\n", .{
             self.capacity,
             load_util.gib(kv_bytes),
             (self.layers.len - sliding) * m.absorbed_stride * 2,
             self.layers.len - sliding,
             sliding,
             if (self.ring) geom.ring.rows else self.capacity,
+            load_util.gib(index_bytes),
+            index_bytes / @max(self.capacity, 1),
+            indexers,
             @as(f64, @floatFromInt(self.index.scoreBytes())) / (1 << 20),
         });
         return self;
