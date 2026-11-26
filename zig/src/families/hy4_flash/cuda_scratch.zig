@@ -20,6 +20,8 @@ pub const sliding_stride = 512;
 pub const rotation = 3;
 /// Rows a pass takes at most: the widest row the per-pass scratch and the recall lists are sized for.
 pub const row_cap = 1024;
+/// Rows the hyper head, the final norm and the LM head run at once: one block of the EXL3 linear's own loop.
+pub const head_block = 128;
 
 /// A sliding layer's KV ring: `rows` slots for the positions written last, a position's slot its `pos % rows`.
 pub const ring = struct {
@@ -126,11 +128,12 @@ pub fn alloc(d: *const cuda.Driver, own: *cuda.exl3_upload.Uploader, max_rows: u
     const r = max_rows;
     const shape = try attn.Shape.init(@intCast(r), 64, sparse_stride);
     var sc: Scratch = undefined;
-    for (&sc.streams) |*x| x.* = try cuda.DeviceBuffer.alloc(d, r * S * H * 2);
+    // The head reads a whole block of the pass's last rows, so the streams it reads run a block past the pass.
+    for (&sc.streams) |*x| x.* = try cuda.DeviceBuffer.alloc(d, (r + head_block - 1) * S * H * 2);
     sc.collapsed = try zeros(own, r * H * 2);
     sc.post = try zeros(own, r * S * 4);
     sc.hidden = try zeros(own, r * H * 2);
-    sc.norm_tmp = try zeros(own, r * D * 2);
+    sc.norm_tmp = try zeros(own, @max(r, head_block) * D * 2);
     sc.q_raw = try zeros(own, r * Q * 2);
     sc.q_tmp = try zeros(own, r * Q * 2);
     sc.q_resid = try zeros(own, r * Q * 2);
@@ -165,8 +168,8 @@ pub fn alloc(d: *const cuda.Driver, own: *cuda.exl3_upload.Uploader, max_rows: u
     sc.e_normalized = try zeros(own, r * engram_cuda.input * 2);
     sc.e_keys = try zeros(own, S * r * H * 2);
     sc.e_value = try zeros(own, r * H * 2);
-    sc.head_hidden = try zeros(own, r * H * 2);
-    sc.head_norm = try zeros(own, r * H * 2);
-    sc.lm_logits = try zeros(own, vocab * 4);
+    sc.head_hidden = try zeros(own, @max(r, head_block) * H * 2);
+    sc.head_norm = try zeros(own, @max(r, head_block) * H * 2);
+    sc.lm_logits = try zeros(own, head_block * vocab * 4);
     return sc;
 }

@@ -77,24 +77,32 @@ pub fn main(init: std.process.Init) !void {
         try scores.ensureTotalCapacity(a, scored);
     }
     const p0 = std.Io.Clock.awake.now(io);
+    var model_ns: i96 = 0; // the passes alone, so the host's scoring is not read as the model's time
+    var score_ns: i96 = 0; // the log-softmax and the tail's copy, which are this binary's bookkeeping
     var row: usize = 0;
     while (row < prompt.len) : (row += chunk) {
         const n = @min(chunk, prompt.len - row);
+        const m0 = std.Io.Clock.awake.now(io);
         if (pass_logits) |all| {
             try hy4.passRows(prompt[row..][0..n], logits, .{ .at = 0, .out = all[0 .. n * V] });
+        } else {
+            try hy4.pass(prompt[row..][0..n], logits);
+        }
+        model_ns += m0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+        if (pass_logits) |all| {
+            const s0 = std.Io.Clock.awake.now(io);
             // Every prompt row but the last one predicts a token, so the last pass's tail row is out.
             try appendScores(&scores, all[0 .. n * V], prompt[row..][0..n], @min(n, prompt.len - 1 - row), V);
             // logits.f32 holds the window's last `keep` rows, so a long window's every-row logits never fit.
             const lo = @max(row, scored - keep);
             const hi = @min(row + n, scored);
             if (lo < hi) @memcpy(tail[(lo - (scored - keep)) * V ..][0 .. (hi - lo) * V], all[(lo - row) * V ..][0 .. (hi - lo) * V]);
-        } else {
-            try hy4.pass(prompt[row..][0..n], logits);
+            score_ns += s0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
         }
     }
     const prefill_ns = p0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     try out.writeFile(io, .{ .sub_path = "prefill-logits.f32", .data = std.mem.sliceAsBytes(logits) });
-    if (pass_logits != null) try writeScores(io, a, out, tail[0 .. keep * V], scores.items, prompt.len, keep, chunk, ring, prefill_ns);
+    if (pass_logits != null) try writeScores(io, a, out, tail[0 .. keep * V], scores.items, prompt.len, keep, chunk, ring, .{ .all = prefill_ns, .model = model_ns, .score = score_ns });
     const d0 = std.Io.Clock.awake.now(io);
     var copy: std.ArrayList(u32) = .empty;
     for (0..new_tokens) |step| {
@@ -109,10 +117,13 @@ pub fn main(init: std.process.Init) !void {
     }
     const decode_ns = d0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     try out.writeFile(io, .{ .sub_path = "generated.u32", .data = std.mem.sliceAsBytes(copy.items) });
-    std.debug.print("prompt {d} tokens: prefill {d:.1} ms ({d:.1} tok/s); decode {d} tokens {d:.1} ms/token\nengram rows {d:.1} ms of the prefill\ngenerated={any}\n", .{
+    std.debug.print("prompt {d} tokens: prefill {d:.1} ms ({d:.1} tok/s) [model {d:.1} ms, {d:.1} tok/s; score {d:.1} ms]; decode {d} tokens {d:.1} ms/token\nengram rows {d:.1} ms of the prefill\ngenerated={any}\n", .{
         prompt.len,
         @as(f64, @floatFromInt(prefill_ns)) / 1e6,
         @as(f64, @floatFromInt(prompt.len)) * 1e9 / @as(f64, @floatFromInt(prefill_ns)),
+        @as(f64, @floatFromInt(model_ns)) / 1e6,
+        @as(f64, @floatFromInt(prompt.len)) * 1e9 / @as(f64, @floatFromInt(model_ns)),
+        @as(f64, @floatFromInt(score_ns)) / 1e6,
         new_tokens,
         @as(f64, @floatFromInt(decode_ns)) / 1e6 / @as(f64, @floatFromInt(@max(new_tokens, 2) - 1)),
         @as(f64, @floatFromInt(hy4.engram_ns)) / 1e6,
@@ -135,15 +146,18 @@ fn appendScores(scores: *std.ArrayList(f32), rows: []const f32, tokens: []const 
 }
 
 /// `exl3_reference.py --score --save-logits`'s layout: logits.f32 for the kept rows, every scored row's log-prob.
-fn writeScores(io: std.Io, a: std.mem.Allocator, out: std.Io.Dir, tail: []const f32, scores: []const f32, prompt_tokens: usize, keep: usize, chunk: usize, ring: bool, prefill_ns: i96) !void {
+const Phases = struct { all: i96, model: i96, score: i96 };
+
+fn writeScores(io: std.Io, a: std.mem.Allocator, out: std.Io.Dir, tail: []const f32, scores: []const f32, prompt_tokens: usize, keep: usize, chunk: usize, ring: bool, ns: Phases) !void {
     try out.writeFile(io, .{ .sub_path = "logits.f32", .data = std.mem.sliceAsBytes(tail) });
     try out.writeFile(io, .{ .sub_path = "scores.f32", .data = std.mem.sliceAsBytes(scores) });
     var nll: f64 = 0;
     for (scores) |s| nll -= @as(f64, s);
     const rows = scores.len;
     const per = @as(f64, @floatFromInt(@max(rows, 1))); // a one-token prompt scores nothing
-    const report = try std.fmt.allocPrint(a, "{{\"prompt_tokens\": {d}, \"scored\": {d}, \"logits_rows\": {d}, \"nll\": {d}, \"ppl\": {d}, \"chunk\": {d}, \"ring\": {s}, \"prefill_s\": {d}}}\n", .{
-        prompt_tokens, rows, keep, nll / per, @exp(nll / per), chunk, if (ring) "true" else "false", @as(f64, @floatFromInt(prefill_ns)) / 1e9,
+    const report = try std.fmt.allocPrint(a, "{{\"prompt_tokens\": {d}, \"scored\": {d}, \"logits_rows\": {d}, \"nll\": {d}, \"ppl\": {d}, \"chunk\": {d}, \"ring\": {s}, \"prefill_s\": {d}, \"model_s\": {d}, \"score_s\": {d}}}\n", .{
+        prompt_tokens, rows, keep, nll / per, @exp(nll / per), chunk, if (ring) "true" else "false",
+        @as(f64, @floatFromInt(ns.all)) / 1e9, @as(f64, @floatFromInt(ns.model)) / 1e9, @as(f64, @floatFromInt(ns.score)) / 1e9,
     });
     try out.writeFile(io, .{ .sub_path = "report.json", .data = report });
     std.debug.print("scored {d} rows, kept {d}: nll {d:.4} ppl {d:.4}\n", .{ rows, keep, nll / per, @exp(nll / per) });
