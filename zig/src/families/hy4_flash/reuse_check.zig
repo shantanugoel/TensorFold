@@ -99,7 +99,7 @@ fn arm(c: *family.Cuda, a: std.mem.Allocator, ids: []const u32, reuse: usize, to
 
 /// An empty context: no history, no kept prefix, and every layer's cache cleared so neither arm reads the other's rows.
 fn reset(c: *family.Cuda) void {
-    c.m.history.items.len = 0;
+    c.m.cut(0, 0);
     c.valid_from = 0;
     c.kept = false;
     for (c.m.layers) |layer| layer.attention.cache.fill8(0, null) catch |e| std.debug.panic("clearing a layer's cache: {s}", .{@errorName(e)});

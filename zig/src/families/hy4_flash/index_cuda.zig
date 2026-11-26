@@ -53,15 +53,13 @@ pub const Indexer = struct {
         projected: u64, // BF16 [gemm_rows, 128]
         norm_tmp: u64,
         staged: u64, // BF16 [gemm_rows, 128]
-        first_slot: usize,
     };
 
-    /// Normalized BF16 token keys of the active rows into contiguous cache slots from `first_slot`.
-    pub fn cacheKeys(_: Indexer, s: cuda.Stream, gemm: *cuda.vit.Gemms, norms: *const cuda.norms.Norms, w: Weights, b: Keys, cache: cuda.DeviceBuffer, hidden_size: usize, eps: f32) !void {
+    /// Normalized BF16 token keys of the active rows, `count` rows of `staged`: the caller copies each sequence's run.
+    pub fn keyRows(_: Indexer, s: cuda.Stream, gemm: *cuda.vit.Gemms, norms: *const cuda.norms.Norms, w: Weights, b: Keys, hidden_size: usize, eps: f32) !void {
         if (b.count == 0 or b.count > b.gemm_rows) return error.BadHy4IndexRows;
         try gemm.run(s, b.hidden, w.token_keys, b.projected, b.gemm_rows, width, hidden_size, .bf16);
         try norms.addRmsTail(s, b.projected, null, w.token_norm, b.norm_tmp, b.staged, null, b.gemm_rows, width, eps, .{ .round = true });
-        try cache.copyFrom(b.first_slot * width * 2, b.staged, b.count * width * 2, s.handle);
     }
 
     /// Pool, normalize and rotate `count` closed groups from `first_group` (positions: each group's first token).
@@ -75,14 +73,27 @@ pub const Indexer = struct {
         try project.rotate(s, rope_base, table, rope_base, .{ .rows = count, .heads = 1, .input_stride = width, .output_stride = width });
     }
 
-    pub const Select = struct {
+    pub const Query = struct {
         q_resid: u64, // BF16 [gemm_rows, q_rank], the q_a_layernorm output
         hidden: u64, // BF16 [gemm_rows, hidden]
         gemm_rows: usize,
+        query: u64, // BF16 [gemm_rows, 16 * 128]
+        head_weights: u64, // BF16 [gemm_rows, 16]
+    };
+
+    /// The pass's query heads and head weights at the pass's own GEMM width, every row of it.
+    pub fn query(self: Indexer, s: cuda.Stream, gemm: *cuda.vit.Gemms, w: Weights, b: Query, q_rank: usize, hidden_size: usize) !void {
+        _ = self;
+        try gemm.run(s, b.q_resid, w.query, b.query, b.gemm_rows, heads * width, q_rank, .bf16);
+        try gemm.run(s, b.hidden, w.head_weights, b.head_weights, b.gemm_rows, heads, hidden_size, .bf16);
+    }
+
+    /// One set's rows from its first: their rotated queries, the groups' scores and their recalled slot lists.
+    pub const Scan = struct {
         positions: u64, // i32 [rows, 3]
         table: u64, // BF16 [rows, 64]
-        query: u64, // BF16 [rows, 16 * 128]
-        head_weights: u64, // BF16 [rows, 16]
+        query: u64,
+        head_weights: u64,
         arena: u64,
         rows: u64, // recall.Row [rows]
         scores: u64,
@@ -90,14 +101,12 @@ pub const Indexer = struct {
         counts: u64,
     };
 
-    /// Rotated query heads, head weights, closed-group scores and the recalled slot list of each row.
-    pub fn select(self: Indexer, s: cuda.Stream, gemm: *cuda.vit.Gemms, project: mla.Projections, w: Weights, b: Select, shape: recall.Shape, q_rank: usize, hidden_size: usize, p: rotary.Parameters) !void {
-        if (shape.rows > b.gemm_rows) return error.BadHy4IndexRows;
-        try gemm.run(s, b.q_resid, w.query, b.query, b.gemm_rows, heads * width, q_rank, .bf16);
+    pub fn scan(self: Indexer, s: cuda.Stream, project: mla.Projections, w: Weights, b: Scan, shape: recall.Shape, p: rotary.Parameters) !void {
+        _ = w;
+        if (shape.rows > std.math.maxInt(u16)) return error.BadHy4IndexRows;
         try project.rotaryTable(s, b.positions, b.table, shape.rows, p);
         const rope_base = b.query + nope * 2;
         try project.rotate(s, rope_base, b.table, rope_base, .{ .rows = shape.rows, .heads = heads, .input_stride = width, .output_stride = width });
-        try gemm.run(s, b.hidden, w.head_weights, b.head_weights, b.gemm_rows, heads, hidden_size, .bf16);
         try self.select_kernels.run(s, .{
             .query = b.query,
             .keys = b.arena,

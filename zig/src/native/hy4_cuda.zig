@@ -101,7 +101,7 @@ fn refuse(a: Allocator, problem: *[]const u8, comptime fmt: []const u8, args: an
 /// The flags this engine's path cannot serve yet, each with the step that brings it; null when they are all absent.
 fn refusal(a: Allocator, o: api.Open) !?[]const u8 {
     if (o.vision != null) return try std.fmt.allocPrint(a, "--vision: the native Hy4-flash engine reads text only; the width's tower is plan step 7.9, so serve without --vision", .{});
-    if (o.lanes > 1) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves one sequence at a time and queues the rest; serve with --parallel 1 (batching is plan step 7.6's follow-on)", .{o.lanes});
+    if (o.lanes > 1) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves one sequence at a time and queues the rest; serve with --parallel 1 (batching is plan step 7.8's second half)", .{o.lanes});
     if (o.tp != 1 or o.rank != 0) return try std.fmt.allocPrint(a, "--tp {d} --rank {d}: the native Hy4-flash engine is one device (1 and 0)", .{ o.tp, o.rank });
     if (o.kv8) return try std.fmt.allocPrint(a, "--kv-cache fp8: this engine's caches are BF16; 8-bit KV is plan step 7.7", .{});
     if (o.drafter != null or o.mtp_confidence != null) return try std.fmt.allocPrint(a, "--drafter and --mtp-confidence: DFly2 is the pack's own component, so --mtp-drafts {d} names its drafts and no separate checkpoint or confidence head is served", .{family.drafts});
@@ -163,7 +163,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.k = family.Kernels.load(gpa, &h.driver) catch |e| return refuse(a, problem, "the native Hy4-flash kernel images cannot load ({s})", .{@errorName(e)});
     errdefer h.k.deinit();
     const drafts = o.mtp_drafts orelse 0;
-    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
+    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
     const bytes = h.c.bytes();
@@ -176,8 +176,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     var timed: ?family.Cuda.Timed = null;
     if (h.c.m.draft != null) timed = h.c.timeWindows() catch |e| ret: {
         std.log.warn("hy4-cuda: the window timing failed ({s}); the depth rule keeps its prior", .{@errorName(e)});
-        h.c.m.history.items.len = 0;
-        h.c.valid_from = 0;
+        for (0..o.lanes) |i| h.c.m.cut(i, 0);
+        for (h.c.seq[0..o.lanes]) |*q| q.valid_from = 0;
         break :ret null;
     };
     if (timed) |t| {
@@ -190,8 +190,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.c.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.startup = try std.fmt.allocPrint(gpa, "CUDA device {d}: Hy4-flash {d}-token context ({d:.2} GiB KV + {d:.2} GiB indexer keys + {d:.0} MiB ring + {d:.0} MiB recall scores), {d:.2} GiB weights, {d:.1} GiB free after the load, one sequence, DFly2 {s}", .{
-        device,                       capacity,
+    h.startup = try std.fmt.allocPrint(gpa, "CUDA device {d}: Hy4-flash {d}-token context x {d} sequences ({d:.2} GiB KV + {d:.2} GiB indexer keys + {d:.0} MiB ring + {d:.0} MiB recall scores), {d:.2} GiB weights, {d:.1} GiB free after the load, DFly2 {s}", .{
+        device,                       capacity,                    o.lanes,
         gib(bytes.kv),                gib(bytes.index),
         @as(f64, @floatFromInt(bytes.ring)) / (1 << 20), @as(f64, @floatFromInt(bytes.scores)) / (1 << 20),
         gib(h.c.m.weight_bytes),      gib(avail),
@@ -200,13 +200,13 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer gpa.free(h.startup);
     h.host = api.LaneHost.init(gpa, io, &h.core, .{
         .name = "hy4-cuda",
-        .lanes = 1,
+        .lanes = o.lanes,
         .context_window = capacity,
         .prefill_step = family.prompt_rows,
         .structures = true,
         .logprobs = true,
         .reasoning = true,
-        .policy = "Hy4-flash CUDA: dense EXL3 groups, BF16 elsewhere, the sliding layers' 1,536-slot ring, one sequence",
+        .policy = "Hy4-flash CUDA: dense EXL3 groups, BF16 elsewhere, the sliding layers' 1,536-slot ring, one sequence a lane",
         .startup = h.startup,
     });
     h.host.on_thread = .{ .ctx = h, .run = bindThread };
@@ -246,7 +246,7 @@ test "Hy4-flash CUDA host: the context this engine serves: whole pages, the reca
 
 test "Hy4-flash CUDA host: a bare serve is served, and every step this path lacks is refused with its step named" {
     const a = std.testing.allocator;
-    // one sequence, which is again what the server's own flags give it (a bare Open's --parallel default is 8)
+    // one sequence, which is what this path serves: requests queue behind it
     const plain: api.Open = .{ .dir = "d", .model_type = model_type, .lanes = 1 };
     try std.testing.expect(try refusal(a, plain) == null);
     // one flag a request cannot bring yet, and the words name the flag: vision, lanes, an 8-bit cache, a drafter

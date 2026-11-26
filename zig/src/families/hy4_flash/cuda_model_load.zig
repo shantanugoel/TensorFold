@@ -63,6 +63,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         return error.BadHy4ModelShape;
     // Past the 2,048-key budget an indexed row attends recall lists, so capacity is free up to the scores' width.
     if (capacity == 0 or capacity > cuda_index.max_capacity or max_rows == 0 or max_rows > geom.row_cap) return error.BadHy4RunnerCapacity;
+    if (o.slots == 0 or o.slots > geom.max_slots) return error.BadHy4RunnerCapacity;
     if (o.ring) try geom.ring.check(max_rows);
     const ck = try a.create(core.Checkpoint);
     ck.* = try core.Checkpoint.openModel(a, io, dir);
@@ -92,8 +93,11 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         .index = undefined,
         .max_rows = max_rows,
         .capacity = capacity,
+        .slots = o.slots,
         .ring = o.ring,
+        .history = try a.alloc(std.ArrayList(u32), o.slots),
     };
+    for (self.history) |*h| h.* = .empty;
     const V: usize = t.vocab_size;
     self.embed = try up(self, ck, "model.embed_tokens.weight", .{}, .bf16, &.{ V, H });
     self.head_hc = .{
@@ -132,7 +136,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     self.engrams = engrams;
     // DFly2's tower: the pack's `model.dfly_layers.*`, on the device only when a round holds drafts.
     if (o.drafts > 0) {
-        self.draft = try dfly.load(a, &self.own, d, ck, cfg.value);
+        self.draft = try dfly.load(a, &self.own, d, ck, cfg.value, self.slots);
         ck.release();
         const dr = self.draft.?;
         std.debug.print("DFly2 drafter: {d} layers of {d}, a block of {d} rows\n", .{ dr.layers.len, dr.inner, dfly.width });
@@ -208,7 +212,8 @@ fn loadLayer(self: *Model, a: std.mem.Allocator, ck: *core.Checkpoint, shards: ?
     const split = try m.splitBf16(tmp, kv_b, heads);
     defer tmp.free(split.key);
     defer tmp.free(split.value);
-    var cache = try cuda.DeviceBuffer.alloc(self.d, (if (sliding and self.ring) geom.ring.rows else self.capacity) * m.absorbed_stride * 2);
+    // Every sequence's own rows: an indexed layer's context, or a sliding layer's ring, one sequence after another.
+    var cache = try cuda.DeviceBuffer.alloc(self.d, self.slots * (if (sliding and self.ring) geom.ring.rows else self.capacity) * m.absorbed_stride * 2);
     try cache.fill8(0, null);
     const att: Attention = .{
         .sliding = sliding,
@@ -233,7 +238,7 @@ fn loadLayer(self: *Model, a: std.mem.Allocator, ck: *core.Checkpoint, shards: ?
         .cache = cache,
         .rows = @intCast(cache.len / (m.absorbed_stride * 2)),
         // Below the key budget nothing selects, so a short context carries no indexer state at all.
-        .index = if (sliding or self.capacity <= sparse_stride) null else try cuda_index.Layer.load(a, self.d, &self.own, ck, i, t, self.capacity),
+        .index = if (sliding or self.capacity <= sparse_stride) null else try cuda_index.Layer.load(a, self.d, &self.own, ck, i, t, self.capacity, self.slots),
     };
     const is_dense = t.mlp_layer_types[i] == .dense;
     const feed: Feed = .{

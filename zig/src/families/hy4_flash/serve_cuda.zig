@@ -1,4 +1,4 @@
-//! Hy4-flash behind the lane engine on CUDA: one sequence, the step 1-3 text model with the indexer and the ring.
+//! Hy4-flash behind the lane engine on CUDA: up to `--parallel` sequences of the step 1-3 text model.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -14,14 +14,20 @@ pub const prompt_rows: u32 = geom.row_cap;
 pub const max_capacity: u32 = @import("cuda_index.zig").max_capacity;
 pub const Kernels = model.Kernels;
 pub const Model = model.Model;
+/// Sequences one server holds at once: `--parallel`, and the per-slot arrays' width.
+pub const max_slots: usize = geom.max_slots;
 /// A verify window's rows: the pending row and DFly2's five drafts, and the drafts a round proposes.
 pub const max_window: u32 = dfly.width;
 pub const drafts: u32 = dfly.drafts;
-/// The sliding layers' ring: a rewind may read back only what the ring still holds (the ring commit's review).
+/// The sliding layers' ring: a rewind may read back only what the ring still holds.
 const ring_rows: u32 = geom.ring.rows;
 const ring_window: u32 = geom.ring.window;
 /// The prompt prefix a reuse shares before its caches are kept rather than refilled from row 0.
 const keep_prefix = 64;
+/// A shared round's rows at most: every sequence's widest window, and never below the engine's own default.
+pub fn batchRows(slots: usize) usize {
+    return @max(32, slots * @max(@as(usize, max_window), 1));
+}
 
 /// A context's caches in bytes, so a size decision is read and not inferred.
 pub const Bytes = struct { kv: u64 = 0, index: u64 = 0, ring: u64 = 0, scores: u64 = 0 };
@@ -41,25 +47,34 @@ pub fn memAvailable() u64 {
     return @import("cuda_load_util.zig").memAvailable();
 }
 
-/// Per-token bytes the model's caches take at its capacity: the full-length KV, the indexer's keys and the scores.
+/// Per-token bytes the caches take at this capacity over every sequence: the KV, the indexer's keys and the scores.
 pub fn bytesPerToken(m: *const model.Model) u64 {
     const b = cacheBytes(m);
     return (b.kv + b.index + b.scores) / @max(@as(u64, m.capacity), 1);
 }
+
+/// One sequence's place in the server: the stream that holds it, its ring's mark, and its drafts.
+const Seq = struct {
+    stream: ?*lanes.Stream = null,
+    valid_from: u32 = 0, // the oldest position whose ring slot still holds that position's own row
+    kept: bool = false, // the caches hold the last released stream's tokens
+    from: usize = 0, // the row the kept shared prefix resumes at
+    at: usize = 0, // prompt tokens filled so far
+    held: [dfly.drafts]u32 = @splat(0),
+    nheld: u32 = 0,
+};
 
 pub const Cuda = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     m: *model.Model,
     vocab: u32,
-    logits: []f32, // the last pass's last row, FP32 as the model writes it: row 0 of `window`
-    window: []f32, // every row of a verify window, `vocab` wide each
+    logits: []f32, // the row at hand, FP32 as the model writes it
+    window: []f32, // every row of a round's windows, `vocab` wide each
     words: []u16, // the row at hand as bf16 words, for the lane sampler
-    /// DFly2's drafts for the next round, and how many of them the last proposal filled.
-    held: [dfly.drafts]u32 = @splat(0),
-    nheld: u32 = 0,
-    valid_from: u32 = 0, // the oldest position whose ring slot still holds that position's own row
-    kept: bool = false, // the caches hold the last released stream's tokens
+    seq: [max_slots]Seq = @splat(Seq{}),
+    slots: usize,
+    batch_rows: usize,
     prefill_rows: u64 = 0,
     prefill_ns: i96 = 0,
     decode_rows: u64 = 0,
@@ -72,15 +87,16 @@ pub const Cuda = struct {
     /// `TF_HY4_ROUND_LOG`: every round's window, its rows' draws and what it kept, on stderr.
     log_rounds: bool = false,
 
-    /// Loads the pack and its caches: `capacity` slots a sequence, the widest pass `prompt_rows` rows, and
-    /// `drafts` DFly2 drafts a round (0: the plain one-row path, which loads no drafter at all).
-    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32) !*Cuda {
+    /// Loads the pack: `slots` sequences' caches of `capacity` positions, `prompt_rows` rows a pass, `drafts` a round.
+    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize) !*Cuda {
         const self = try a.create(Cuda);
         errdefer a.destroy(self);
-        const m = try model.Model.open(a, io, d, s, k, dir, .{ .capacity = capacity, .max_rows = prompt_rows, .drafts = rounds });
+        const m = try model.Model.open(a, io, d, s, k, dir, .{ .capacity = capacity, .max_rows = prompt_rows, .drafts = rounds, .slots = slots });
         errdefer model.Model.free(m);
         const vocab: usize = m.text.vocab_size;
-        const window = try a.alloc(f32, vocab * max_window);
+        // Every row a round can hold: the engine's batch width, which is this many sequences' windows at least.
+        const rows: usize = batchRows(slots);
+        const window = try a.alloc(f32, vocab * rows);
         errdefer a.free(window);
         self.* = .{
             .gpa = a,
@@ -90,6 +106,8 @@ pub const Cuda = struct {
             .logits = window[0..vocab],
             .window = window,
             .words = try a.alloc(u16, vocab),
+            .slots = slots,
+            .batch_rows = rows,
             .log_rounds = @import("sys").environment.read(bool, "TF_HY4_ROUND_LOG", false) catch false,
         };
         return self;
@@ -107,32 +125,56 @@ pub const Cuda = struct {
         return cacheBytes(self.m);
     }
 
+    /// The slot the stream holds; null before the first prompt chunk handed it one.
+    pub fn slotOf(self: *const Cuda, s: *const lanes.Stream) ?usize {
+        for (self.seq[0..self.slots], 0..) |q, i| if (q.stream == s) return i;
+        return null;
+    }
+
+    /// A free slot for `s`, or NoFreeSlot: what it held stays, a kept prefix and the ring's high-water mark.
+    fn openSlot(self: *Cuda, s: *lanes.Stream) !usize {
+        for (self.seq[0..self.slots], 0..) |*q, i| {
+            if (q.stream != null) continue;
+            const kept = q.kept;
+            const from = q.valid_from;
+            q.* = .{ .stream = s, .kept = kept, .valid_from = from };
+            return i;
+        }
+        return error.NoFreeSlot;
+    }
+
+    pub fn freeSlots(self: *const Cuda) usize {
+        var n: usize = 0;
+        for (self.seq[0..self.slots]) |q| n += @intFromBool(q.stream == null);
+        return n;
+    }
+
     /// The oldest position a rewind to length `r` may read: its first row's window must still hold its own rows.
-    pub fn mayRewind(self: *const Cuda, r: u32) bool {
+    pub fn mayRewind(self: *const Cuda, slot: usize, r: u32) bool {
         const first = if (r + 1 > ring_window) r + 1 - ring_window else 0;
-        return first >= self.valid_from;
+        return first >= self.seq[slot].valid_from;
     }
 
     /// After a pass: the ring's high-water mark, so nothing before `H + 1 - ring_rows` is readable any more.
-    fn bump(self: *Cuda) void {
-        const h = self.m.history.items.len;
+    pub fn bump(self: *Cuda, slot: usize) void {
+        const h = self.m.len(slot);
         const from = if (h > ring_rows) h - ring_rows else 0;
-        self.valid_from = @max(self.valid_from, @as(u32, @intCast(from)));
+        self.seq[slot].valid_from = @max(self.seq[slot].valid_from, @as(u32, @intCast(from)));
     }
 
-    /// `tokens` at the caches' end: the model's pass, then the ring's bookkeeping and the timers.
-    pub fn pass(self: *Cuda, tokens: []const u32) !void {
-        const start = self.m.history.items.len;
+    /// `tokens` at the sequence's caches' end: the model's pass, then the ring's bookkeeping and the timers.
+    pub fn pass(self: *Cuda, slot: usize, tokens: []const u32) !void {
+        const start = self.m.len(slot);
         self.logits = self.window[0..self.vocab];
-        // Inside `capacity`, every write slot is inside its layer's arena: the write kernel skips a stray one silently.
+        // Inside `capacity` every write slot is inside its sequence's arena: a stray one is skipped silently.
         if (start + tokens.len > self.m.capacity) return error.Hy4ContextFull;
         // The model appends before it forwards: a failed pass leaves the history claiming rows nothing wrote.
         errdefer {
-            self.m.history.items.len = start;
-            self.kept = false;
+            self.m.cut(slot, start);
+            self.seq[slot].kept = false;
         }
         const t0 = std.Io.Clock.awake.now(self.io);
-        try self.m.pass(tokens, self.logits);
+        try self.m.passRuns(&.{.{ .slot = slot, .tokens = tokens }}, self.logits, null);
         const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
         if (tokens.len == 1) {
             self.decode_rows += 1;
@@ -142,11 +184,11 @@ pub const Cuda = struct {
             self.prefill_rows += tokens.len;
             self.prefill_ns += ns;
         }
-        self.bump();
+        self.bump(slot);
     }
 
     /// The row's draw: greedy in the model's FP32 logits, else the lane sampler over the same row as bf16 words.
-    fn draw(self: *Cuda, s: *lanes.Stream, position: u64, mask: []const u32) !u32 {
+    pub fn draw(self: *Cuda, s: *lanes.Stream, position: u64, mask: []const u32) !u32 {
         if (mask.len == 0) {
             if (s.sampling) |v| {
                 if (v.temperature <= 0) return self.greedy();
@@ -165,7 +207,7 @@ pub const Cuda = struct {
     }
 
     /// One row's log probabilities over the model's FP32 logits, with the best `count` ids.
-    fn row(self: *const Cuda, pick: u32, count: u8) lanes.LogprobRow {
+    pub fn row(self: *const Cuda, pick: u32, count: u8) lanes.LogprobRow {
         const top = lanes.logprob.max_top;
         var most: f64 = -std.math.inf(f64);
         for (self.logits) |v| most = @max(most, v);
@@ -205,15 +247,12 @@ pub const Cuda = struct {
     }
 
     pub fn backend(self: *Cuda) be.Backend {
-        // `keep_full_lone`: a window the target accepts whole is still a round's keep. The rewind is the identity
-        // there, but the round's accepted count and the drafter's held state are read off `keep`, so ask for it.
-        return .{ .ptr = self, .keep_full_lone = true, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .first_row = firstRowFn, .release = releaseFn } };
+        // `keep_full_lone`: a window accepted whole is still a round's keep — the round's count is read off it.
+        const round = @import("serve_cuda_round.zig");
+        return .{ .ptr = self, .keep_full_lone = true, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .cancel_prefill = cancelPrefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = round.verifyFn, .keep = round.keepFn, .draft = round.draftFn, .held = round.heldFn, .first_row = firstRowFn, .release = releaseFn, .reports_fill = true } };
     }
 
-    /// The window widths and a draft slot, timed once at load: ms a pass by rows (1..`max_window`) and ms a
-    /// draft slot. The lane core's depth rule prices a round from these; without them it drafts one whenever its
-    /// first draft's rate is under 0.8, whatever the block would have accepted. `serve_metal.zig`'s `warm` times the
-    /// same widths. The caches end up as they started: empty, with the ring readable from row 0.
+    /// The window widths and a draft slot, timed once at load: the depth rule prices a round from these.
     pub const Timed = struct { rows: [max_window]f64 = @splat(0), slot_ms: f64 = 0 };
 
     pub fn timeWindows(self: *Cuda) !Timed {
@@ -221,14 +260,14 @@ pub const Cuda = struct {
         var timed: Timed = .{};
         var ids: [dfly.width + 2]u32 = @splat(0);
         for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
-        try self.pass(&ids);
-        const at = self.m.history.items.len;
+        try self.pass(0, &ids);
+        const at = self.m.len(0);
         for (1..max_window + 1) |width| {
             var times: [3]f64 = undefined;
             for (&times) |*tm| {
-                self.m.history.items.len = at;
+                self.m.cut(0, at);
                 const t0 = std.Io.Clock.awake.now(self.io);
-                try self.m.passRows(ids[0..width], self.logits, .{ .at = 0, .out = self.window[0 .. width * self.vocab], .head = width });
+                try self.m.passRuns(&.{.{ .slot = 0, .tokens = ids[0..width] }}, self.logits, .{ .at = 0, .out = self.window[0 .. width * self.vocab], .head = width });
                 tm.* = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds())) / 1e6;
             }
             std.mem.sort(f64, &times, {}, std.sort.asc(f64));
@@ -236,20 +275,22 @@ pub const Cuda = struct {
         }
         // A draft slot's cost over a block of three: the first call also warms the tower's own path.
         var held: [dfly.drafts]u32 = @splat(0);
-        self.m.history.items.len = at;
+        const head = dfly.source(dr, 0, null);
+        self.m.cut(0, at);
         for (0..2) |which| {
             const t0 = std.Io.Clock.awake.now(self.io);
-            try dfly.propose(self.m, dr, at, ids[at - 1], 3, dfly.source(dr, null), held[0..3]);
+            try dfly.propose(self.m, dr, 0, at, ids[at - 1], 3, head, held[0..3]);
             if (which == 1) timed.slot_ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds())) / 1e6 / 3;
         }
         std.log.info("hy4-cuda: window ms by rows {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2}, draft {d:.2} ms a slot", .{
             timed.rows[0], timed.rows[1], timed.rows[2], timed.rows[3], timed.rows[4], timed.rows[5], timed.slot_ms,
         });
-        // The warm rows go: the first stream fills from row 0 as on a cold load.
-        self.m.history.items.len = 0;
-        self.valid_from = 0;
-        self.nheld = 0;
-        self.kept = false;
+        // The warm rows go: the first stream fills from row 0 as on a cold load, in every sequence.
+        for (self.seq[0..self.slots]) |*q| q.* = .{};
+        for (0..self.slots) |i| {
+            self.m.cut(i, 0);
+            dr.scratch.seq[i] = .{};
+        }
         self.decode_rows = 0;
         self.decode_ns = 0;
         self.prefill_rows = 0;
@@ -261,74 +302,105 @@ pub const Cuda = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    /// The prompt into the caches in `prompt_rows`-row passes, resuming the kept caches' shared prefix where it may.
+    /// The prompt into the sequence's caches in `prompt_rows`-row passes, resuming the kept shared prefix.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = cast(ptr);
         const ids = s.prompt();
         if (ids.len + s.max_new > self.m.capacity) return error.Hy4ContextFull;
         const t0 = std.Io.Clock.awake.now(self.io);
-        const from = try self.fill(ids, s);
+        const from = try self.fill(s);
         const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
         std.log.debug("hy4-cuda: prompt {d} tokens, {d} reused, {d} prefilled in {d:.1} ms", .{ ids.len, from, ids.len - from, @as(f64, @floatFromInt(ns)) / 1e6 });
     }
 
-    /// `fill`, and the stream's own accounting: the rows it reused, its cancellation and each pass's width.
-    pub fn fill(self: *Cuda, ids: []const u32, s: ?*lanes.Stream) !usize {
+    /// `fill`, whole: one prompt's chunks in a row, for a caller with no other stream to serve.
+    pub fn fill(self: *Cuda, s: *lanes.Stream) !usize {
+        while (!try self.prefillStep(s, 0)) {}
+        return self.seq[self.slotOf(s) orelse return error.NoFreeSlot].from;
+    }
+
+    /// One chunk of a prompt: at most `max_rows` rows (0: this engine's own cut), true once the prompt is in.
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) !bool {
+        return cast(ptr).prefillStep(s, max_rows);
+    }
+
+    pub fn prefillStep(self: *Cuda, s: *lanes.Stream, max_rows: u32) !bool {
+        const ids = s.prompt();
         if (ids.len == 0) return error.EmptyHy4Prompt;
-        if (ids.len > self.m.capacity) return error.Hy4ContextFull;
-        const from = self.reuseFrom(ids);
-        if (s) |stream| stream.cached = @intCast(from);
-        var at = from;
-        while (at < ids.len) {
-            if (s) |stream| {
-                if (stream.isCancelled()) return error.Cancelled;
-            }
-            const end = @min(ids.len, at + prompt_rows);
-            try self.pass(ids[at..end]);
-            if (s) |stream| lanes.prefill_widths.completed(self.gpa, stream, end - at);
-            at = end;
+        if (ids.len + s.max_new > self.m.capacity) return error.Hy4ContextFull;
+        const slot = self.slotOf(s) orelse blk: {
+            const i = try self.openSlot(s);
+            const q = &self.seq[i];
+            q.from = self.reuseFrom(i, ids);
+            s.cached = @intCast(q.from);
+            q.at = q.from;
+            s.fill_at.store(@intCast(q.at), .monotonic);
+            break :blk i;
+        };
+        const q = &self.seq[slot];
+        if (q.at >= ids.len) return true;
+        if (s.isCancelled()) {
+            s.keepInterruptedPrefill(@intCast(q.at));
+            return error.Cancelled;
         }
-        return from;
+        const cap: usize = if (max_rows == 0) prompt_rows else @min(max_rows, prompt_rows);
+        const end = @min(ids.len, q.at + cap);
+        try self.pass(slot, ids[q.at..end]);
+        s.fill_at.store(@intCast(end), .monotonic);
+        lanes.prefill_widths.completed(self.gpa, s, end - q.at);
+        q.at = end;
+        return end == ids.len;
+    }
+
+    /// A cancelled prompt's rows are kept: the next prompt sharing them resumes there (no prompt work runs here).
+    fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
+        const self = cast(ptr);
+        const slot = self.slotOf(s) orelse return;
+        self.seq[slot].kept = true;
+        s.keepInterruptedPrefill(@intCast(self.seq[slot].at));
     }
 
     /// The row a fill starts at: the kept shared prefix, when it is long enough and the ring still holds its first row.
-    pub fn reuseFrom(self: *Cuda, ids: []const u32) usize {
+    pub fn reuseFrom(self: *Cuda, slot: usize, ids: []const u32) usize {
         var from: usize = 0;
-        if (self.kept and ids.len > 0) {
-            const hist = self.m.history.items;
+        if (self.seq[slot].kept and ids.len > 0) {
+            const hist = self.m.tokens(slot);
             var same: usize = 0;
             const most = @min(hist.len, ids.len - 1);
             while (same < most and hist[same] == ids[same]) same += 1;
-            if (same >= keep_prefix and self.mayRewind(@intCast(same))) from = same;
-            self.kept = false;
+            if (same >= keep_prefix and self.mayRewind(slot, @intCast(same))) from = same;
+            self.seq[slot].kept = false;
         }
-        if (self.m.history.items.len != from) {
-            self.m.history.items.len = from;
-            if (from == 0) self.valid_from = 0;
+        if (self.m.len(slot) != from) {
+            self.m.cut(slot, from);
+            if (from == 0) self.seq[slot].valid_from = 0;
         }
         return from;
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) !u64 {
         const self = cast(ptr);
-        if (position != self.m.history.items.len) return error.InvalidHy4Position;
+        const slot = self.slotOf(s) orelse return error.UnknownHy4Stream;
+        if (position != self.m.len(slot)) return error.InvalidHy4Position;
         return try self.draw(s, position, &.{});
     }
 
     fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) !u64 {
         const self = cast(ptr);
-        if (position != self.m.history.items.len) return error.InvalidHy4Position;
+        const slot = self.slotOf(s) orelse return error.UnknownHy4Stream;
+        if (position != self.m.len(slot)) return error.InvalidHy4Position;
         return try self.draw(s, position, mask);
     }
 
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, f: be.Feed, position: u64) !u64 {
         const self = cast(ptr);
-        if (position != self.m.history.items.len + 1) return error.InvalidHy4Position;
+        const slot = self.slotOf(s) orelse return error.UnknownHy4Stream;
+        if (position != self.m.len(slot) + 1) return error.InvalidHy4Position;
         const token: u32 = switch (f) {
             .value => |v| v,
             .handle => |h| @intCast(h),
         };
-        try self.pass(&.{token});
+        try self.pass(slot, &.{token});
         return try self.draw(s, position, &.{});
     }
 
@@ -342,136 +414,12 @@ pub const Cuda = struct {
         return self.row(self.greedy(), s.logprobs orelse 0);
     }
 
-    /// A window's rows in one pass, every row drawn at its own position; `keep` rolls the rejected rows back.
-    /// With a drafter loaded the whole window is one 6-row forward whose rows all need logits; without one the
-    /// window is its pending row alone and the pass hands back its last row as it always has.
-    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) !void {
-        const self = cast(ptr);
-        const words = (self.vocab + 31) / 32;
-        if (windows.len != out.len) return error.InvalidHy4Windows;
-        for (windows, out) |w, o| {
-            const rows = w.rows();
-            if (rows > max_window or w.parents != null or o.sampled.len != rows or o.drafts.len + 1 != rows) return error.UnsupportedHy4Window;
-            const base = self.m.history.items.len;
-            for (w.positions, 0..) |p, r| if (p != base + r + 1) return error.InvalidHy4Position;
-            var ids: [max_window]u32 = undefined;
-            ids[0] = w.pending;
-            // The drafts the last proposal held, then the host's. A window wider than the drafts on hand (the
-            // block did not fit the context, or a copy brought more rows) repeats its last one: any token is a
-            // valid window row, and the accept rule still takes only the target's own samples.
-            const held = @min(@as(usize, w.held), @as(usize, self.nheld));
-            @memcpy(ids[1..][0..held], self.held[0..held]);
-            for (held..w.held) |i| ids[1 + i] = if (held > 0) self.held[held - 1] else w.pending;
-            @memcpy(ids[1 + w.held ..][0..w.tokens.len], w.tokens);
-            self.nheld = 0;
-            @memcpy(o.drafts, ids[1..rows]);
-            if (w.held > 0) {
-                self.draft_rounds += 1;
-                self.draft_proposed += w.held;
-                if (self.log_rounds) std.log.info("hy4-cuda: round {d} at row {d}: window {any}", .{ self.draft_rounds, base, ids[0..rows] });
-            }
-            if (self.m.draft != null) try self.verifyPass(ids[0..rows]) else try self.pass(ids[0..rows]);
-            for (0..rows) |r| {
-                self.logits = self.window[(@min(r, max_window - 1)) * self.vocab ..][0..self.vocab];
-                const mask = if (w.masks.len >= (r + 1) * words) w.masks[r * words ..][0..words] else &.{};
-                o.sampled[r] = try self.draw(w.stream, w.positions[r], mask);
-                if (o.rows.len == rows) o.rows[r] = self.row(o.sampled[r], w.stream.logprobs orelse 0);
-                if (self.log_rounds) std.log.info("hy4-cuda: round {d} row {d} (position {d}): drew {d} on {d:.4}", .{ self.draft_rounds, r, w.positions[r], o.sampled[r], self.logits[o.sampled[r]] });
-            }
-        }
-        self.logits = self.window[0..self.vocab];
-    }
-
-    /// A window's rows in one forward, every row's logits kept: the drafter reads the last kept row's hidden
-    /// state and its target layers' recalled lists from this pass, so it is the only pass a proposal follows.
-    fn verifyPass(self: *Cuda, ids: []const u32) !void {
-        const rows = ids.len;
-        const start = self.m.history.items.len;
-        if (start + rows > self.m.capacity) return error.Hy4ContextFull;
-        self.logits = self.window[0..self.vocab];
-        const t0 = std.Io.Clock.awake.now(self.io);
-        try self.m.passRows(ids, self.window[0..self.vocab], .{ .at = 0, .out = self.window[0 .. rows * self.vocab], .head = rows });
-        const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
-        self.decode_rows += rows;
-        self.decode_ns += ns;
-        self.bump();
-    }
-
-    /// Roll each stream back to the rows it kept: the target's caches hold one sequence, so this cuts its history.
-    /// The row count never reaches the ring's 1,025-row rewind bound (a window is six rows), and `valid_from` only
-    /// moves forward, so a rewind always reads slots this pass wrote.
-    fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) !void {
-        const self = cast(ptr);
-        for (windows, paths) |w, path| {
-            for (path, 0..) |r, i| if (r != i) return error.UnsupportedHy4Tree;
-            const rows = w.rows();
-            if (path.len == 0 or path.len > rows) return error.UnsupportedHy4Window;
-            const base = self.m.history.items.len;
-            if (base < rows) return error.InvalidHy4Position;
-            self.m.history.items.len = base - rows + path.len;
-            if (path.len > 1) self.draft_kept += path.len - 1;
-            if (self.log_rounds) std.log.info("hy4-cuda: round {d} kept {d} of {d} rows (drafts {d} of {d}), history {d} -> {d}", .{ self.draft_rounds, path.len, rows, path.len - 1, rows - 1, base, self.m.history.items.len });
-            self.nheld = 0;
-        }
-    }
-
-    /// DFly2: a block of the round's anchor and five masks over the target's own caches, then one head a slot.
-    fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) !void {
-        const self = cast(ptr);
-        const dr = if (self.m.draft) |*x| x else return error.NoHy4DraftHead;
-        for (requests) |r| {
-            self.nheld = 0;
-            if (r.depth > dfly.drafts) return error.UnsupportedHy4Window;
-            const anchor = self.m.history.items.len;
-            if (r.position != @as(u64, anchor) + 1) return error.InvalidHy4Position;
-            if (r.depth == 0) continue;
-            const kept: ?usize = if (r.rows) |rows| blk: {
-                if (rows.len == 0) return error.UnsupportedHy4Window;
-                for (rows, 0..) |x, i| if (x != i) return error.UnsupportedHy4Tree;
-                break :blk rows.len - 1;
-            } else null;
-            const bonus: u32 = if (r.follow.len > 0) r.follow[r.follow.len - 1] else switch (r.first orelse return error.NoFirstToken) {
-                .value => |v| v,
-                .handle => |h| @intCast(h),
-            };
-            // The block's rows must fit the context, and a target that has selected nothing gives the dense
-            // prefix, which is wider than a draft row's stride once the context passes 2,048 positions.
-            const dense = !dr.scratch.selected;
-            if (anchor + dfly.width > self.m.capacity or (dense and anchor + dfly.width > dfly.key_stride)) {
-                // The block would write past the context: hold the anchor's own token so the planned window is
-                // still one the target can verify, and let drafting resume once the reply is done.
-                @memset(self.held[0..r.depth], bonus);
-                self.nheld = r.depth;
-                continue;
-            }
-            const t0 = std.Io.Clock.awake.now(self.io);
-            try dfly.propose(self.m, dr, anchor, bonus, r.depth, dfly.source(dr, kept), self.held[0..r.depth]);
-            if (self.draft_rounds <= 3) std.log.info("hy4-cuda: DFly2 block at {d} from row {d}: bonus {d}, proposals {any}", .{ anchor, dfly.source(dr, kept), bonus, self.held[0..r.depth] });
-            self.draft_ns += t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
-            self.nheld = r.depth;
-            if (self.draft_rounds % 16 == 0) std.log.info("hy4-cuda: DFly2 {d:.2} accepted a draft over {d} steps ({d} proposed, {d} kept), {d:.1} ms a proposal", .{
-                if (self.draft_rounds == 0) 0 else @as(f64, @floatFromInt(self.draft_kept)) / @as(f64, @floatFromInt(self.draft_rounds)),
-                self.draft_rounds,
-                self.draft_proposed,
-                self.draft_kept,
-                @as(f64, @floatFromInt(self.draft_ns)) / 1e6 / @as(f64, @floatFromInt(self.draft_proposed)),
-            });
-        }
-        self.logits = self.window[0..self.vocab];
-    }
-
-    /// The drafts a proposal holds for the stream, in window order (a grammar walks them).
-    fn heldFn(ptr: *anyopaque, _: *lanes.Stream, out: []u32) !void {
-        const self = cast(ptr);
-        if (out.len > self.nheld) return error.Hy4DraftsNotHeld;
-        @memcpy(out, self.held[0..out.len]);
-    }
-
     /// The caches stay for the next prompt: a shared prefix resumes there instead of filling from row 0.
-    fn releaseFn(ptr: *anyopaque, _: *lanes.Stream) void {
+    fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = cast(ptr);
-        self.kept = true;
-        self.nheld = 0;
+        const slot = self.slotOf(s) orelse return;
+        const from = self.seq[slot].valid_from;
+        self.seq[slot] = .{ .kept = true, .valid_from = from };
     }
 };
 
@@ -530,24 +478,28 @@ test "a context's caches split into the KV that grows, the ring that does not an
 
 test "a rewind is allowed exactly while the ring still holds the rows its first window reads" {
     var c: Cuda = undefined;
-    c.valid_from = 0;
-    try std.testing.expect(c.mayRewind(0));
-    try std.testing.expect(c.mayRewind(ring_rows));
-    c.valid_from = 512; // the state after a 2,048-token fill
-    try std.testing.expect(c.mayRewind(1023)); // first row reads from 512: still its own
-    try std.testing.expect(!c.mayRewind(1022)); // first row would read 511, overwritten by then
-    try std.testing.expect(!c.mayRewind(0));
+    c.seq = @splat(Seq{});
+    c.seq[0] = .{ .valid_from = 0 };
+    try std.testing.expect(c.mayRewind(0, 0));
+    try std.testing.expect(c.mayRewind(0, ring_rows));
+    c.seq[0].valid_from = 512; // the state after a 2,048-token fill
+    try std.testing.expect(c.mayRewind(0, 1023)); // first row reads from 512: still its own
+    try std.testing.expect(!c.mayRewind(0, 1022)); // first row would read 511, overwritten by then
+    try std.testing.expect(!c.mayRewind(0, 0));
 }
 
 test "a rewind drops 1,025 rows and no more: a row reads back 511 of its own" {
     var c: Cuda = undefined;
     const h: u32 = 8_192; // a fill past four ring wraps
-    c.valid_from = h - ring_rows;
+    c.seq = @splat(Seq{});
+    c.seq[1] = .{ .valid_from = h - ring_rows };
     // The first row a rewind to `r` writes reads positions r-511..r, so r-511 must still be its own row.
     try std.testing.expectEqual(@as(u32, h - ring_rows), h - 1025 - 511);
-    try std.testing.expect(c.mayRewind(h - 1024));
-    try std.testing.expect(c.mayRewind(h - 1025));
-    try std.testing.expect(!c.mayRewind(h - 1026));
+    try std.testing.expect(c.mayRewind(1, h - 1024));
+    try std.testing.expect(c.mayRewind(1, h - 1025));
+    try std.testing.expect(!c.mayRewind(1, h - 1026));
+    // Two sequences' marks are their own: the second's does not move the first's.
+    try std.testing.expect(c.mayRewind(0, 0));
 }
 
 test "a prompt resumes at its shared prefix only above the keep floor and inside the ring's bound" {
@@ -555,31 +507,38 @@ test "a prompt resumes at its shared prefix only above the keep floor and inside
     var prompt: [4_096]u32 = undefined;
     for (&hist, 0..) |*t, i| t.* = @intCast(i % 1000 + 1);
     @memcpy(&prompt, &hist);
+    const hists = try std.heap.page_allocator.alloc(std.ArrayList(u32), 2);
+    defer std.heap.page_allocator.free(hists);
+    hists[0] = .{ .items = hist[0..0], .capacity = hist.len, .pointer_stability = .{} };
+    hists[1] = .{ .items = hist[0..0], .capacity = hist.len, .pointer_stability = .{} };
     var m: model.Model = undefined;
     m.capacity = 262_144;
+    m.slots = 2;
+    m.history = hists;
     var c: Cuda = undefined;
     c.m = &m;
+    c.slots = 2;
+    c.seq = @splat(Seq{});
 
     // A 2,048-row history, the caches kept, and a prompt sharing 1,024 rows of it: the fill resumes at 1,024.
     prompt[1024] = 5;
-    m.history = .{ .items = hist[0..2048], .capacity = hist.len, .pointer_stability = .{} };
-    c.valid_from = 2048 - ring_rows;
-    c.kept = true;
-    try std.testing.expectEqual(@as(usize, 1024), c.reuseFrom(&prompt));
-    try std.testing.expect(!c.kept); // one fill decides, and the caches are no longer kept
-    try std.testing.expectEqual(@as(usize, 1024), m.history.items.len); // the history is cut to the resume
+    m.history[0] = .{ .items = hist[0..2048], .capacity = hist.len, .pointer_stability = .{} };
+    c.seq[0] = .{ .kept = true, .valid_from = 2048 - ring_rows };
+    try std.testing.expectEqual(@as(usize, 1024), c.reuseFrom(0, &prompt));
+    try std.testing.expect(!c.seq[0].kept); // one fill decides, and the caches are no longer kept
+    try std.testing.expectEqual(@as(usize, 1024), m.len(0)); // the history is cut to the resume
+    // The other sequence's history is untouched by the first sequence's resume.
+    try std.testing.expectEqual(@as(usize, 0), m.len(1));
 
     // A 63-row prefix is below the floor: a shorter fill is not worth resuming, so the next prompt starts at row 0.
-    m.history = .{ .items = hist[0..63], .capacity = hist.len, .pointer_stability = .{} };
-    c.valid_from = 0;
-    c.kept = true;
-    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(&prompt));
-    try std.testing.expectEqual(@as(usize, 0), m.history.items.len);
+    m.history[0] = .{ .items = hist[0..63], .capacity = hist.len, .pointer_stability = .{} };
+    c.seq[0] = .{ .kept = true, .valid_from = 0 };
+    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(0, &prompt));
+    try std.testing.expectEqual(@as(usize, 0), m.len(0));
 
     // A prefix the ring no longer holds: 300 rows into a 2,403-row fill, its first new row reads an overwritten slot.
     prompt[300] = 6;
-    m.history = .{ .items = hist[0..2403], .capacity = hist.len, .pointer_stability = .{} };
-    c.valid_from = 2403 - ring_rows;
-    c.kept = true;
-    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(&prompt));
+    m.history[0] = .{ .items = hist[0..2403], .capacity = hist.len, .pointer_stability = .{} };
+    c.seq[0] = .{ .kept = true, .valid_from = 2403 - ring_rows };
+    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(0, &prompt));
 }

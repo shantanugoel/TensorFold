@@ -22,6 +22,11 @@ pub const rotation = 3;
 pub const row_cap = 1024;
 /// Rows the hyper head, the final norm and the LM head run at once: one block of the EXL3 linear's own loop.
 pub const head_block = 128;
+/// Sequences one server serves at once (`--parallel`): the fixed per-slot arrays are this wide.
+pub const max_slots = 8;
+
+/// One sequence's rows of a pass: the slot they belong to, appended at that sequence's own history's end.
+pub const Run = struct { slot: usize, tokens: []const u32 };
 
 /// A sliding layer's KV ring: `rows` slots for the positions written last, a position's slot its `pos % rows`.
 pub const ring = struct {

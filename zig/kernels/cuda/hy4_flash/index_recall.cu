@@ -48,11 +48,13 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_recall_groups(
         for (uint32_t i = threadIdx.x; i < keep; i += 256) selected[i] = i;
     }
     __syncthreads();
+    // A row's slot list is its own sequence's: the group arena's base is the cache's base, in groups of four slots.
+    const uint32_t slot_base = rows[r].group_base * 4u;
     int32_t *out = tokens + uint64_t(r) * a.group_budget * 4;
     const uint32_t count = keep * 4 + position % 4 + 1;
     for (uint32_t i = threadIdx.x; i < count; i += 256) {
         const uint32_t id = i / 4 < keep ? uint32_t(selected[i / 4]) : closed;
-        out[i] = int32_t(id * 4 + i % 4);
+        out[i] = int32_t(slot_base + id * 4 + i % 4);
     }
     if (threadIdx.x == 0) counts[r] = int32_t(count);
 }

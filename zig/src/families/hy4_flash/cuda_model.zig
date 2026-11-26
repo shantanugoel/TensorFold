@@ -154,9 +154,12 @@ pub const Model = struct {
     index: cuda_index.Scratch,
     max_rows: usize,
     capacity: usize,
+    /// Sequences the caches hold, one after another: `--parallel`.
+    slots: usize,
     /// The sliding layers' KV as `geom.ring.rows` slots; false is the full-length arm the ring is gated against.
     ring: bool,
-    history: std.ArrayList(u32) = .empty,
+    /// One token history a sequence, so a pass's Engram rows and a reuse read their own.
+    history: []std.ArrayList(u32),
     expert_scratch: exl3.Shared = .{},
     weight_bytes: usize = 0,
     /// The Engram tables in layer order, so a pass starts every table's rows at once.
@@ -165,27 +168,47 @@ pub const Model = struct {
     engram_ns: i96 = 0,
     /// The pack's DFly2 drafter, when a round holds drafts: `cuda_draft.zig`, and null on the one-row path.
     draft: ?dfly.Draft = null,
-    /// A row's four streams after every layer, for the row-count check: the trunk's own answer to "does this row
-    /// depend on how many rows went through with it". Null unless a debug tool asks; nothing in the server sets it.
+    /// A row's four streams after every layer, for the row-count check: does this row depend on its pass's width.
     trace: ?Trace = null,
 
     pub const Trace = struct {
         row: usize,
         buf: cuda.DeviceBuffer,
-        /// The row's router picks and logits after every layer's routing: a near tie that flips with the pass's
-        /// shape is a different expert set, which is the one discrete way a row can move.
+        /// The row's router picks and it after every layer: a near tie that flips with the pass's shape moved the row.
         picks: cuda.DeviceBuffer,
         scores: cuda.DeviceBuffer,
     };
 
-    /// What one load takes: the context's rows, the widest pass, whether sliding layers keep a ring, and the
-    /// drafts a round holds (0: no DFly2 drafter, which is the only shape a one-row window has).
+    /// What one load takes: the context's rows, the widest pass, the ring, the drafts a round holds, the sequences.
     pub const Options = struct {
         capacity: usize,
         max_rows: usize,
         ring: bool = true,
         drafts: u32 = 0,
+        slots: usize = 1,
     };
+
+    /// A sequence's first slot in an indexed layer's cache, and in a sliding layer's ring.
+    pub fn seqBase(self: *const Model, slot: usize) usize {
+        return slot * self.capacity;
+    }
+
+    pub fn ringBase(self: *const Model, slot: usize) usize {
+        return slot * (if (self.ring) geom.ring.rows else self.capacity);
+    }
+
+    /// A sequence's tokens so far, and a cut back to `n` of them (a rewind, a reuse, a failed pass).
+    pub fn len(self: *const Model, slot: usize) usize {
+        return self.history[slot].items.len;
+    }
+
+    pub fn cut(self: *Model, slot: usize, n: usize) void {
+        self.history[slot].items.len = n;
+    }
+
+    pub fn tokens(self: *const Model, slot: usize) []const u32 {
+        return self.history[slot].items;
+    }
 
     fn hcShape(self: *const Model, rows: usize, gates: u32) ihc.Shape {
         return .{ .rows = @intCast(rows), .width = H, .gates = gates, .eps = self.text.rms_norm_eps, .gate_eps = self.text.hc_eps, .post_magnitude = self.text.hc_magnitude };
@@ -203,29 +226,65 @@ pub const Model = struct {
         }
     }
 
-    /// Which pass rows to hand back: `out` holds one `vocab`-wide FP32 row a pass row from `at` on.
-    /// `head`: rows the hyper head, the final norm and the LM head run at once (null: the LM head's own block).
+    /// Which pass rows to hand back: `out` holds one `vocab`-wide FP32 row a pass row from `at` on, `head` at a time.
     pub const Rows = struct { at: usize, out: []f32, head: ?usize = null };
 
-    /// Run `tokens` (appended at the current history length) through the model; returns the last row's logits.
-    pub fn pass(self: *Model, tokens: []const u32, logits_out: []f32) !void {
-        return self.passRows(tokens, logits_out, null);
+    /// Run `ids` (appended at sequence 0's own history end) through the model; returns the last row's logits.
+    pub fn pass(self: *Model, ids: []const u32, logits_out: []f32) !void {
+        return self.passRows(ids, logits_out, null);
     }
 
     /// `pass`, and the rows `rows_out` names into it, as one `vocab`-wide FP32 row each.
-    pub fn passRows(self: *Model, tokens: []const u32, logits_out: []f32, rows_out: ?Rows) !void {
-        const rows = tokens.len;
-        const start = self.history.items.len;
-        if (rows == 0 or rows > self.max_rows or start + rows > self.capacity) return error.BadHy4PassRows;
-        try self.history.appendSlice(self.a, tokens);
+    pub fn passRows(self: *Model, ids: []const u32, logits_out: []f32, rows_out: ?Rows) !void {
+        return self.passRuns(&.{.{ .slot = 0, .tokens = ids }}, logits_out, rows_out);
+    }
+
+    /// `runs`: one pass over several sequences' rows, each run appended at its own history's end, its rows from `at`.
+    pub fn passRuns(self: *Model, runs: []const geom.Run, logits_out: []f32, rows_out: ?Rows) !void {
+        if (runs.len == 0 or runs.len > geom.max_slots) return error.BadHy4PassRows;
+        var rows: usize = 0;
+        var first: [geom.max_slots]usize = undefined; // each run's first pass row
+        var starts: [geom.max_slots]usize = undefined; // and its first position in its own sequence
+        for (runs, 0..) |run, i| {
+            if (run.slot >= self.slots) return error.BadHy4PassRows;
+            const start = self.history[run.slot].items.len;
+            if (run.tokens.len == 0 or start + run.tokens.len > self.capacity) return error.BadHy4PassRows;
+            first[i] = rows;
+            starts[i] = start;
+            rows += run.tokens.len;
+        }
+        if (rows == 0 or rows > self.max_rows) return error.BadHy4PassRows;
+        // Every row's sequence and its position in it, in pass order: a run's rows are its own sequence's, in order.
+        const pass_a = std.heap.page_allocator; // a pass's own buffers are freed a pass; `a` keeps them a process
+        const row_slot = try pass_a.alloc(u32, rows);
+        defer pass_a.free(row_slot);
+        const row_pos = try pass_a.alloc(u32, rows);
+        defer pass_a.free(row_pos);
+        const row_set = try pass_a.alloc(u32, rows);
+        defer pass_a.free(row_set);
+        const row_tok = try pass_a.alloc(u32, rows);
+        defer pass_a.free(row_tok);
+        const selecting = try pass_a.alloc(bool, runs.len);
+        defer pass_a.free(selecting);
+        for (runs, 0..) |run, i| {
+            const last = starts[i] + run.tokens.len - 1;
+            // Past the key budget an indexed row's list comes from its own sequence's indexer, so nothing is built.
+            selecting[i] = self.capacity > sparse_stride and last >= sparse_stride;
+            for (0..run.tokens.len) |j| {
+                row_slot[first[i] + j] = @intCast(run.slot);
+                row_pos[first[i] + j] = @intCast(starts[i] + j);
+                row_set[first[i] + j] = @intCast(i);
+                row_tok[first[i] + j] = run.tokens[j];
+            }
+        }
+        for (runs) |run| try self.history[run.slot].appendSlice(self.a, run.tokens);
         const sc = self.scratch;
         const s = self.s;
         const k = self.k;
         const eps = self.text.rms_norm_eps;
-        const pass_a = std.heap.page_allocator; // a pass's own buffers are freed a pass; `a` keeps them a process
         // Embedding into four identical streams.
         var x = sc.streams[0].ptr;
-        for (tokens, 0..) |tok, r| for (0..S) |st| {
+        for (row_tok, 0..) |tok, r| for (0..S) |st| {
             try sc.streams[0].copyFrom((r * S + st) * H * 2, self.embed + @as(u64, tok) * H * 2, H * 2, s.handle);
         };
         // Positions (text: t = h = w), write slots and key lists for both attention kinds.
@@ -236,18 +295,17 @@ pub const Model = struct {
         const ring_writes = try pass_a.alloc(u32, rows);
         defer pass_a.free(ring_writes);
         for (0..rows) |r| {
-            const p: i32 = @intCast(start + r);
+            const p: i32 = @intCast(row_pos[r]);
             positions[r * 3 ..][0..3].* = .{ p, p, p };
-            writes[r] = @intCast(start + r);
+            // An indexed layer's cache is every sequence's in turn; a sliding layer's ring the same.
+            writes[r] = @intCast(self.seqBase(row_slot[r]) + row_pos[r]);
             // Sliding layers read and write the ring's slots; with the ring off they keep their position's row.
-            ring_writes[r] = @intCast(if (self.ring) geom.ring.slot(start + r) else start + r);
+            ring_writes[r] = @intCast(self.ringBase(row_slot[r]) + if (self.ring) geom.ring.slot(row_pos[r]) else row_pos[r]);
         }
         try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(positions), s.handle);
         try sc.write_slots.uploadAsync(0, std.mem.sliceAsBytes(writes), s.handle);
         try sc.write_ring.uploadAsync(0, std.mem.sliceAsBytes(ring_writes), s.handle);
-        // Past the budget an indexed row's list comes from the layer's indexer, so nothing is built here.
-        const lists = self.capacity > sparse_stride and start + rows - 1 >= sparse_stride;
-        const keys_sparse = try pass_a.alloc(u32, if (lists) 0 else rows * sparse_stride);
+        const keys_sparse = try pass_a.alloc(u32, rows * sparse_stride);
         defer pass_a.free(keys_sparse);
         const keys_sliding = try pass_a.alloc(u32, rows * sliding_stride);
         defer pass_a.free(keys_sliding);
@@ -258,35 +316,44 @@ pub const Model = struct {
         @memset(keys_sparse, 0);
         @memset(keys_sliding, 0);
         for (0..rows) |r| {
-            const pos = start + r;
-            if (!lists) {
+            const slot = row_slot[r];
+            const pos = row_pos[r];
+            if (!selecting[row_set[r]]) {
                 counts_sparse[r] = @intCast(pos + 1);
-                for (0..pos + 1) |j| keys_sparse[r * sparse_stride + j] = @intCast(j);
+                for (0..pos + 1) |j| keys_sparse[r * sparse_stride + j] = @intCast(self.seqBase(slot) + j);
             }
-            const first = if (pos + 1 > sliding_stride) pos + 1 - sliding_stride else 0;
-            counts_sliding[r] = @intCast(pos + 1 - first);
-            for (first..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(if (self.ring) geom.ring.slot(j) else j);
+            const from = if (pos + 1 > sliding_stride) pos + 1 - sliding_stride else 0;
+            counts_sliding[r] = @intCast(pos + 1 - from);
+            for (from..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(self.ringBase(slot) + if (self.ring) geom.ring.slot(j) else j);
         }
-        // Engram rows for the whole pass: a row hashes from the token ids alone, so all four tables start at once.
+        // Engram rows for the pass: a row hashes from its own sequence's tokens, so the four tables start at once.
         const windows = try pass_a.alloc([engram.order]u32, rows);
         defer pass_a.free(windows);
         const pad = self.text.engram_pad_id;
-        for (windows, 0..) |*w, r| {
-            const pos = start + r;
-            for (w, 0..) |*v, back| v.* = if (pos >= back) self.history.items[pos - back] else pad;
+        for (0..rows) |r| {
+            const hist = self.history[row_slot[r]].items;
+            const pos = row_pos[r];
+            for (&windows[r], 0..) |*v, back| v.* = if (pos >= back) hist[pos - back] else pad;
         }
         const et0 = std.Io.Clock.awake.now(self.io);
         var gathers = try engram_pass.Rows.start(pass_a, self.io, self.engrams, windows, engram_cuda.input, engram_readers);
         defer gathers.close(self.io);
         self.engram_ns += et0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
 
-        // DFly2 reads the last kept row's hidden state and its five target layers' recalled lists.
-        if (self.draft) |*dr| {
-            const cap = &dr.scratch;
-            cap.selected = lists;
-            cap.rows = if (rows <= dfly.width) rows else 1;
-            cap.anchor = if (rows <= dfly.width) rows - 1 else 0;
-        }
+        // DFly2 reads a kept row's hidden state and its five target layers' recalled lists: a run's own last row.
+        if (self.draft) |*dr| for (runs, 0..) |run, i| {
+            const whole = run.tokens.len <= dfly.width;
+            const at = if (whole) first[i] else first[i] + run.tokens.len - 1;
+            const sq = &dr.scratch.seq[run.slot];
+            sq.selected = selecting[i];
+            sq.cap_at = at;
+            sq.keep = if (whole) run.tokens.len else 1;
+            // The head's own rows are the pass's when the caller asked for every row, else the one row it kept.
+            sq.head0 = if (rows_out) |want| first[i] - want.at else 0;
+            sq.anchor = if (rows_out) |want| at - want.at else 0;
+        };
+        var sets: [geom.max_slots]cuda_index.RowSet = undefined;
+        for (runs, 0..) |run, i| sets[i] = .{ .slot = run.slot, .first = starts[i], .rows = run.tokens.len, .row0 = first[i], .select = selecting[i] };
         const rope_sparse = try self.text.rotary(.deepseek_sparse_attention);
         var slot: usize = 0; // index of the stream buffer x lives in
         for (self.layers, 0..) |*layer, layer_index| {
@@ -319,21 +386,28 @@ pub const Model = struct {
             try k.gemm.run(s, sc.hidden, at.kv_a, sc.kv, rows, m.absorbed_stride, H, .bf16);
             try self.project(s, at.gate, sc.hidden, rows, sc.gate, .bf16);
             const stride: usize = if (at.sliding) sliding_stride else sparse_stride;
-            if (at.index) |ix| try cuda_index.forward(.{
-                .s = s, .indexer = &k.indexer, .gemms = &k.gemm, .norms = &k.norms, .project = k.project,
-                .scratch = &self.index, .layer = ix, .hidden = sc.hidden, .q_resid = sc.q_resid,
-                .write_slots = sc.write_slots.ptr, .positions = sc.positions.ptr, .table = sc.table,
-                .slots = sc.slots.ptr, .counts = sc.counts.ptr, .first = start, .rows = rows, .select = lists,
-                .epsilon = eps, .rope = rope_sparse, .q_rank = Q, .hidden_size = H,
-            });
+            var any_dense = false;
+            for (selecting) |sel| any_dense = any_dense or !sel;
+            // The rows below the budget attend their own prefix; the indexer then overwrites a selecting run's rows.
             if (at.sliding) {
                 try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(keys_sliding), s.handle);
                 try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(counts_sliding), s.handle);
-            } else if (!lists) {
+            } else if (any_dense) {
                 try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(keys_sparse), s.handle);
                 try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(counts_sparse), s.handle);
-            } else if (self.draft) |*dr| {
-                try self.capture(dr, layer_index, rows);
+            }
+            if (at.index) |ix| {
+                try cuda_index.forward(.{
+                    .s = s, .indexer = &k.indexer, .gemms = &k.gemm, .norms = &k.norms, .project = k.project,
+                    .scratch = &self.index, .layer = ix, .hidden = sc.hidden, .q_resid = sc.q_resid,
+                    .positions = sc.positions.ptr, .table = sc.table, .slots = sc.slots.ptr, .counts = sc.counts.ptr,
+                    .sets = sets[0..runs.len], .rows = rows, .epsilon = eps, .rope = rope_sparse, .q_rank = Q,
+                    .hidden_size = H,
+                });
+                if (self.draft) |*dr| for (sets[0..runs.len]) |set| {
+                    if (!set.select) continue;
+                    try self.capture(dr, layer_index, set.slot);
+                };
             }
             const shape = try attn.Shape.init(@intCast(rows), at.heads, @intCast(stride));
             try mla.forward(k.project, k.attention, s, .{
@@ -363,16 +437,16 @@ pub const Model = struct {
             slot = (slot + 1) % 3;
             x = after_attn;
             // Feed-forward half.
-            const f = &layer.feed;
-            try k.ihc.collapse(s, .{ .hidden = x, .projection = f.hc.project, .bias = f.hc.bias, .scale = f.hc.scale, .output = sc.collapsed, .post = sc.post }, self.hcShape(rows, 2 * S));
-            try k.norms.addRmsTail(s, sc.collapsed, null, f.input_norm, sc.norm_tmp, sc.hidden, null, rows, H, eps, .{ .round = true });
-            switch (f.mlp) {
+            const feed = &layer.feed;
+            try k.ihc.collapse(s, .{ .hidden = x, .projection = feed.hc.project, .bias = feed.hc.bias, .scale = feed.hc.scale, .output = sc.collapsed, .post = sc.post }, self.hcShape(rows, 2 * S));
+            try k.norms.addRmsTail(s, sc.collapsed, null, feed.input_norm, sc.norm_tmp, sc.hidden, null, rows, H, eps, .{ .round = true });
+            switch (feed.mlp) {
                 .dense => |dn| {
                     try self.project(s, dn.gate, sc.hidden, rows, sc.ff_gate, .bf16);
                     try self.project(s, dn.up, sc.hidden, rows, sc.ff_up, .bf16);
                     try k.act.swiglu(s, sc.ff_gate, D, sc.ff_up, D, sc.ff_inner, null, rows, D);
                     try self.project(s, dn.down, sc.ff_inner, rows, sc.shared, .bf16);
-                    try k.norms.addRmsTail(s, sc.shared, null, f.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
+                    try k.norms.addRmsTail(s, sc.shared, null, feed.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
                 },
                 .sparse => |sp| {
                     try k.gemm.run(s, sc.hidden, sp.latent_in, sc.latent, rows, L, H, .bf16);
@@ -389,7 +463,7 @@ pub const Model = struct {
                     try self.project(s, sp.shared_up, sc.hidden, rows, sc.ff_up, .bf16);
                     try k.act.swiglu(s, sc.ff_gate, L, sc.ff_up, L, sc.ff_inner, null, rows, L);
                     try self.project(s, sp.shared_down, sc.ff_inner, rows, sc.shared, .bf16);
-                    try k.norms.addRmsTail(s, sc.route_out, sc.shared, f.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
+                    try k.norms.addRmsTail(s, sc.route_out, sc.shared, feed.output_norm, sc.norm_tmp, sc.branch_norm, null, rows, H, eps, .{ .round = true });
                 },
             }
             const after_ff = sc.streams[(slot + 1) % 3].ptr;
@@ -408,9 +482,7 @@ pub const Model = struct {
             if (want.out.len != count * V or count == 0 or want.at + count > rows) return error.BadHy4PassRows;
             try self.headRows(s, x, want.at, count, want.out, want.head orelse geom.head_block);
             if (want.at + count == rows) {
-                // The caller's range covers the pass's last row, so `logits_out` takes that row too — unless it
-                // is that same storage: a verify window asks for every row and reads them all from `want.out`,
-                // and a copy from the last row over the first would hand every draw the wrong row's logits.
+                // The pass's last row is in range, so `logits_out` takes it too — unless that is the same storage.
                 const last = want.out[(rows - 1 - want.at) * V ..][0..V];
                 if (!inside(want.out, logits_out)) @memcpy(logits_out[0..V], last);
                 held = true;
@@ -419,8 +491,7 @@ pub const Model = struct {
         if (!held) try self.headRows(s, x, rows - 1, 1, logits_out, @min(geom.head_block, rows));
     }
 
-    /// Whether `part` lies wholly inside `whole`: a verify window's rows are one buffer, and writing the last row
-/// over the first (as the `logits_out` convenience does) would hand every draw the wrong row's logits.
+    /// Whether `part` lies wholly inside `whole`: a verify window's last row must not overwrite its first.
 fn inside(whole: []const f32, part: []const f32) bool {
     const start = @intFromPtr(whole.ptr);
     const at = @intFromPtr(part.ptr);
@@ -444,7 +515,8 @@ fn inside(whole: []const f32, part: []const f32) bool {
         var owned = [_]cuda.DeviceBuffer{ sc.positions, sc.slots, sc.counts, sc.write_slots, sc.write_ring, sc.e_raw, self.index.recall_rows, self.index.scores, self.index.group_positions };
         for (&owned) |*b| b.free();
         self.own.deinit();
-        self.history.deinit(self.a);
+        for (self.history) |*h| h.deinit(self.a);
+        self.a.free(self.history);
         self.cfg.deinit();
         self.ck.close();
         self.a.destroy(self.ck);
@@ -455,20 +527,18 @@ fn inside(whole: []const f32, part: []const f32) bool {
     }
 
     /// A draft layer's share of a pass: its target layer's recall lists for the rows a later proposal reads.
-    /// A pass wider than a proposal block (a prompt chunk) keeps only its last row, the only one a draft reads.
-    fn capture(self: *Model, dr: *dfly.Draft, layer: usize, rows: usize) !void {
-        const whole = rows <= dfly.width;
-        const at = if (whole) 0 else rows - 1;
-        const keep = if (whole) rows else 1;
+    fn capture(self: *Model, dr: *dfly.Draft, layer: usize, slot: usize) !void {
+        const keep = dr.scratch.seq[slot].keep;
+        const at = dr.scratch.seq[slot].cap_at;
         for (dr.layers, 0..) |l, i| {
             if (l.target_index != layer) continue;
-            try dr.scratch.lists[i].copyFrom(0, self.scratch.slots.ptr + at * sparse_stride * 4, keep * sparse_stride * 4, self.s.handle);
-            try dr.scratch.captured[i].copyFrom(0, self.scratch.counts.ptr + at * 4, keep * 4, self.s.handle);
+            const at_slot = i * dr.scratch.seq.len + slot;
+            try dr.scratch.lists[at_slot].copyFrom(0, self.scratch.slots.ptr + at * sparse_stride * 4, keep * sparse_stride * 4, self.s.handle);
+            try dr.scratch.captured[at_slot].copyFrom(0, self.scratch.counts.ptr + at * 4, keep * 4, self.s.handle);
         }
     }
 
     /// `count` pass rows from `at` through the hyper head, the final norm and the LM head, `block` rows a call.
-    /// A verify window names its own row count, so a six-row pass costs six rows and not a whole head block.
     fn headRows(self: *Model, s: cuda.Stream, x: u64, at: usize, count: usize, out: []f32, block: usize) !void {
         const sc = self.scratch;
         const k = self.k;

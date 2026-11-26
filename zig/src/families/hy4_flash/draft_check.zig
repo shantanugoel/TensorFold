@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
     const one = try a.alloc(f32, V);
     const block = try a.alloc(f32, rows * V);
     const wide = try a.alloc(f32, rows * V);
-    const anchor = m.history.items.len;
+    const anchor = m.history[0].items.len;
     const bonus = argmax(c.logits);
     std.debug.print("anchor {d}, plain draw {d}\n", .{ anchor, bonus });
 
@@ -80,14 +80,14 @@ pub fn main(init: std.process.Init) !void {
     // (1) the anchor alone, the plain one-row path with the LM head's own 128-row block.
     const ids1 = [1]u32{bonus};
     try m.pass(&ids1, one);
-    m.history.items.len = anchor;
+    m.history[0].items.len = anchor;
     std.debug.print("one row: {d}\n", .{argmax(one)});
 
     // (2) the same anchor as the block's first row, the verify path's head over `rows` rows.
     var ids: [dfly.width]u32 = @splat(dr.mask);
     ids[0] = bonus;
     try m.passRows(ids[0..rows], c.logits, .{ .at = 0, .out = block[0 .. rows * V], .head = rows });
-    m.history.items.len = anchor;
+    m.history[0].items.len = anchor;
     std.debug.print("block row 0: {d}, max|one - block row 0| {d:.6}, top-2 one {d} {d:.4}, block {d} {d:.4}\n", .{
         argmax(block[0..V]),
         maxDiff(one, block[0..V]),
@@ -100,18 +100,18 @@ pub fn main(init: std.process.Init) !void {
 
     // (2b) the same block with the LM head at its own 128-row block: is the row count the head's, or the pass's?
     try m.passRows(ids[0..rows], c.logits, .{ .at = 0, .out = wide[0 .. rows * V], .head = null });
-    m.history.items.len = anchor;
+    m.history[0].items.len = anchor;
     var widest: f32 = 0;
     for (0..rows) |r| widest = @max(widest, maxDiff(block[r * V ..][0..V], wide[r * V ..][0..V]));
     std.debug.print("head at 128 rows: row 0 {d}, max|head {d} - head 128| {d:.6}\n", .{ argmax(wide[0..V]), rows, widest });
 
     // (3) a proposal, then the same block again: nothing the drafter wrote may move the target's own rows.
     var held: [dfly.drafts]u32 = @splat(0);
-    try dfly.propose(m, dr, anchor, bonus, @intCast(rows - 1), dfly.source(dr, null), held[0 .. rows - 1]);
+    try dfly.propose(m, dr, 0, anchor, bonus, @intCast(rows - 1), dfly.source(dr, 0, null), held[0 .. rows - 1]);
     std.debug.print("proposals {any}\n", .{held[0 .. rows - 1]});
     for (0..rows - 1) |i| ids[1 + i] = held[i];
     try m.passRows(ids[0..rows], c.logits, .{ .at = 0, .out = block[0 .. rows * V], .head = rows });
-    m.history.items.len = anchor;
+    m.history[0].items.len = anchor;
     std.debug.print("after a proposal, row 0: {d}, max|one - row 0| {d:.6}\n", .{ argmax(block[0..V]), maxDiff(one, block[0..V]) });
     for (0..rows) |r| std.debug.print("  verified row {d}: {d} (proposed {d})\n", .{ r, argmax(block[r * V ..][0..V]), if (r == 0) bonus else held[r - 1] });
 
@@ -126,22 +126,22 @@ pub fn main(init: std.process.Init) !void {
     var slot_kept: [dfly.drafts]usize = @splat(0);
     var rounds: usize = 0;
     for (0..2) |arm| {
-        m.history.items.len = prompt.len;
+        m.history[0].items.len = prompt.len;
         c.valid_from = 0;
         if (arm == 0) _ = try c.fill(prompt, null); // the logits the first draw comes from
         var pending = argmax(c.logits);
         var prev_kept: usize = 1; // the last kept row of the pass before this round
         for (0..steps) |step| {
-            const at = m.history.items.len;
+            const at = m.history[0].items.len;
             const draw: u32 = if (arm == 0) blk: {
                 const only = [1]u32{pending};
                 try m.pass(&only, one);
-                m.history.items.len = at;
+                m.history[0].items.len = at;
                 break :blk argmax(one);
             } else blk: {
                 const depth: u32 = @intCast(rows - 1);
                 var hold: [dfly.drafts]u32 = @splat(0);
-                try dfly.propose(m, dr, at, pending, depth, if (step == 0) dfly.source(dr, null) else prev_kept - 1, hold[0..depth]);
+                try dfly.propose(m, dr, 0, at, pending, depth, if (step == 0) dfly.source(dr, 0, null) else prev_kept - 1, hold[0..depth]);
                 ids[0] = pending;
                 for (0..depth) |i| ids[1 + i] = hold[i];
                 try m.passRows(ids[0..rows], c.logits, .{ .at = 0, .out = block[0 .. rows * V], .head = rows });
@@ -155,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
                     kept += 1;
                     accepted += 1;
                 }
-                m.history.items.len = at + kept;
+                m.history[0].items.len = at + kept;
                 prev_kept = kept;
                 break :blk argmax(block[(kept - 1) * V ..][0..V]);
             };
@@ -164,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (arm == 0) {
             std.debug.print("plain {d}: {any}\n", .{ steps, plain });
-            m.history.items.len = prompt.len;
+            m.history[0].items.len = prompt.len;
         } else {
             std.debug.print("drafted {d}: {any}\n", .{ steps, drafted });
             std.debug.print("{d}/{d} drafts accepted over {d} rounds = {d:.2} a step; by slot:\n", .{ accepted, proposed, rounds, @as(f64, @floatFromInt(accepted)) / @as(f64, @floatFromInt(@max(rounds, 1))) });
@@ -196,7 +196,7 @@ fn timeShapes(a: std.mem.Allocator, c: *family.Cuda, from: usize) !void {
     for (shapes) |sh| {
         var times: [7]f64 = undefined;
         for (&times) |*tm| {
-            m.history.items.len = from;
+            m.history[0].items.len = from;
             const t0 = std.Io.Clock.awake.now(c.io);
             try m.passRows(ids[0..sh.rows], c.logits, .{ .at = 0, .out = out[0 .. sh.rows * V], .head = sh.head });
             tm.* = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(c.io)).toNanoseconds())) / 1e6;
@@ -204,7 +204,7 @@ fn timeShapes(a: std.mem.Allocator, c: *family.Cuda, from: usize) !void {
         std.mem.sort(f64, &times, {}, std.sort.asc(f64));
         std.debug.print("  {s:<38} {d:8.2} ms ({d:6.2} ms a row)\n", .{ sh.name, times[3], times[3] / @as(f64, @floatFromInt(sh.rows)) });
     }
-    m.history.items.len = from;
+    m.history[0].items.len = from;
 }
 
 /// One row's four streams after every layer, the same row fed alone and inside a six-row window: the first layer
@@ -233,7 +233,7 @@ fn traceLayers(a: std.mem.Allocator, c: *family.Cuda, from: usize, first: u32) !
     for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
     ids[0] = first;
     const out = try a.alloc(f32, dfly.width * V);
-    m.history.items.len = from;
+    m.history[0].items.len = from;
     m.trace = .{ .row = 0, .buf = buf, .picks = picks, .scores = scores };
     defer m.trace = null;
     try c.pass(ids[0..1]);
@@ -241,13 +241,13 @@ fn traceLayers(a: std.mem.Allocator, c: *family.Cuda, from: usize, first: u32) !
     try picks.downloadAsync(0, alone_picks, m.s.handle);
     try scores.downloadAsync(0, alone_scores, m.s.handle);
     try m.s.synchronize();
-    m.history.items.len = from;
+    m.history[0].items.len = from;
     try m.passRows(ids[0..], c.logits, .{ .at = 0, .out = out[0 .. dfly.width * V], .head = dfly.width });
     try buf.downloadAsync(0, window, m.s.handle);
     try picks.downloadAsync(0, window_picks, m.s.handle);
     try scores.downloadAsync(0, window_scores, m.s.handle);
     try m.s.synchronize();
-    m.history.items.len = from;
+    m.history[0].items.len = from;
     std.debug.print("row 0's hidden after every layer, one row alone against the same row in a {d}-row pass:\n", .{dfly.width});
     std.debug.print("  layer   relative RMS   max |delta|   (row alone's RMS)\n", .{});
     for (0..layers) |l| {
@@ -362,15 +362,15 @@ fn dumpRounds(a: std.mem.Allocator, io: std.Io, c: *family.Cuda, prompt: []const
         _ = try c.fill(prefix[0..last], null);
         const only = [1]u32{prefix[last]};
         try m.pass(&only, c.logits);
-        const anchor = m.history.items.len;
+        const anchor = m.history[0].items.len;
         const drawn = argmax(c.logits);
         const bonus = cont[t]; // teacher: the continuation's own token, whether or not this engine drew it
-        try dfly.propose(m, dr, anchor, bonus, dfly.drafts, dfly.source(dr, null), &held);
+        try dfly.propose(m, dr, 0, anchor, bonus, dfly.drafts, dfly.source(dr, 0, null), &held);
         ids[0] = bonus;
         for (0..dfly.drafts) |i| ids[1 + i] = held[i];
         try m.passRows(ids[0..], c.logits, .{ .at = 0, .out = block[0 .. dfly.width * V], .head = dfly.width });
         @memcpy(verify, block);
-        m.history.items.len = anchor;
+        m.history[0].items.len = anchor;
         try trail.fused.downloadAsync(0, fused, m.s.handle);
         try trail.carry.downloadAsync(0, carry, m.s.handle);
         try trail.cat.downloadAsync(0, cat, m.s.handle);
@@ -454,7 +454,7 @@ fn measureRows(a: std.mem.Allocator, c: *family.Cuda, from: usize, positions: us
     std.debug.print("row count: {d} rows a width from position {d}, KL(window || one at a time)\n", .{ positions, from });
     for ([_]usize{ 6, 4, 2 }) |width| {
         if (width > dfly.width) continue;
-        m.history.items.len = from;
+        m.history[0].items.len = from;
         // The stream's first token is the prompt's own draw; each arm re-derives the rest from its own rows, so
         // the tokens are the one-row arm's and both arms see them.
         var next: u32 = first;
@@ -466,7 +466,7 @@ fn measureRows(a: std.mem.Allocator, c: *family.Cuda, from: usize, positions: us
         var control: f32 = 0; // the same one-row pass twice: what this box's own arithmetic does
         var blocks: usize = 0;
         while (blocks * width < positions) : (blocks += 1) {
-            const at = m.history.items.len;
+            const at = m.history[0].items.len;
             if (at + width > m.capacity) break;
             for (0..width) |r| {
                 ids[r] = next;
@@ -475,17 +475,17 @@ fn measureRows(a: std.mem.Allocator, c: *family.Cuda, from: usize, positions: us
                 @memcpy(single[r * V ..][0..V], c.logits);
                 next = argmax(c.logits);
             }
-            m.history.items.len = at;
+            m.history[0].items.len = at;
             try m.passRows(ids[0..width], c.logits, .{ .at = 0, .out = block[0 .. width * V], .head = width });
-            m.history.items.len = at + width;
+            m.history[0].items.len = at + width;
             if (blocks == 0) { // a control: row 0 fed alone twice, which must be the same numbers
-                m.history.items.len = at;
+                m.history[0].items.len = at;
                 const again = try a.alloc(f32, V);
                 defer a.free(again);
                 const only = [1]u32{ids[0]};
                 try m.passRows(&only, c.logits, .{ .at = 0, .out = again, .head = 1 });
                 control = maxDiff(single[0..V], again);
-                m.history.items.len = at + width;
+                m.history[0].items.len = at + width;
             }
             for (0..width) |r| {
                 const kl = divergence(block[r * V ..][0..V], single[r * V ..][0..V]);

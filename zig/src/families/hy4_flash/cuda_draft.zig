@@ -1,11 +1,4 @@
 //! Hy4-flash's DFly2 drafter on CUDA: five gated-MLA layers over the target's own caches and recalled lists.
-//!
-//! The algorithm is [hy4-dfly2-port](../../../../../../docs/kb/hy4-dfly2-port.md)'s, the one `metal_draft.zig`
-//! serves on Metal: one forward of the anchor row and five mask rows, then one correction and one head call a slot.
-//! Two shares make the five layers small. Each binds a target indexed layer's cache (`dfly_target_kv_layers`)
-//! instead of keeping its own, reading the target's recall list for the kept row instead of running an indexer;
-//! and each writes its block's rows into that shared cache at the anchor's positions, which the verification
-//! forward overwrites, so nothing the drafter stores outlives the round it was written in.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
@@ -141,19 +134,27 @@ pub const Scratch = struct {
     previous: cuda.DeviceBuffer, // BF16 [hidden]: the token the next slot's correction reads
     logits: u64, // F32 [vocab]
     ids: cuda.DeviceBuffer, // i32 [1]
-    /// The five target layers' recall lists as the target's passes wrote them, a block row each at most.
-    lists: [layers]cuda.DeviceBuffer,
-    captured: [layers]cuda.DeviceBuffer, // u32 [width] a layer: the counts beside `lists`
-    /// The last pass's captured rows and the row its anchor sits in (a prompt chunk keeps only its last row).
-    rows: usize = 0,
-    anchor: usize = 0,
-    /// Whether the last pass's rows attended the indexer's recall lists at all.
-    selected: bool = false,
+    /// The five target layers' lists as the passes wrote them: a layer's five sequences', one after another.
+    lists: []cuda.DeviceBuffer,
+    captured: []cuda.DeviceBuffer, // u32 [width] a layer a sequence: the counts beside `lists`
+    /// What the last pass left for each sequence: the rows it captured, and where a proposal reads them.
+    seq: []Seq,
 };
 
-/// One round's interior, for the same-input differential against another engine (`draft_check.zig`'s dump mode):
-/// the fused anchor row, the block's six final-normed rows, and each slot's corrected hidden and logits row.
-/// A harness reads it; a served round leaves `trail` null and pays nothing.
+/// One sequence's capture facts from the last pass.
+pub const Seq = struct {
+    /// Whether the pass's rows attended the indexer's recall lists at all.
+    selected: bool = false,
+    /// The pass row whose lists a proposal reads: a window's first, or a prompt chunk's last.
+    cap_at: usize = 0,
+    keep: usize = 1, // rows captured from `cap_at`
+    /// The head's own row of `cap_at`, which the fusion's target carry is read from.
+    anchor: usize = 0,
+    /// The head's row of the last window's first row: a kept window row `r` sits at `head0 + r`.
+    head0: usize = 0,
+};
+
+/// One round's interior, for the same-input differential against another engine (`draft_check.zig`'s dump mode).
 pub const Trail = struct {
     fused: cuda.DeviceBuffer, // BF16 [H]: row 0 after the fusion
     carry: cuda.DeviceBuffer, // BF16 [H]: the target's post-final-norm row the fusion read
@@ -226,7 +227,8 @@ fn widen(a: std.mem.Allocator, raw: []const u8, count: usize) ![]f32 {
 }
 
 /// The checkpoint's `model.dfly_layers.*` onto the device: five layers, the fusion, the correction and the head.
-pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cuda.Driver, ck: *core.Checkpoint, cfg: config.Model) !Draft {
+pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cuda.Driver, ck: *core.Checkpoint, cfg: config.Model, slots: usize) !Draft {
+    if (slots == 0 or slots > geom.max_slots) return error.BadHy4DraftGeometry;
     const t = cfg.text_config;
     if (t.hidden_size != H or t.q_lora_rank != Q or t.kv_lora_rank != m.latent) return error.BadHy4ModelShape;
     if (cfg.dfly_num_hidden_layers != layers or cfg.dfly_target_kv_layers.len != layers or cfg.dfly_target_index_layer.len != layers)
@@ -310,8 +312,15 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
     sc.previous = try alloc(d, H * 2);
     sc.logits = try zeros(d, @as(usize, t.vocab_size) * 4);
     sc.ids = try alloc(d, 4);
-    for (&sc.lists) |*b| b.* = try alloc(d, width * geom.sparse_stride * 4);
-    for (&sc.captured) |*b| b.* = try alloc(d, width * 4);
+    sc.lists = try a.alloc(cuda.DeviceBuffer, layers * slots);
+    errdefer a.free(sc.lists);
+    sc.captured = try a.alloc(cuda.DeviceBuffer, layers * slots);
+    errdefer a.free(sc.captured);
+    for (sc.lists) |*b| b.* = try alloc(d, width * geom.sparse_stride * 4);
+    for (sc.captured) |*b| b.* = try alloc(d, width * 4);
+    sc.seq = try a.alloc(Seq, slots);
+    errdefer a.free(sc.seq);
+    for (sc.seq) |*q| q.* = .{};
     const host_keys = try a.alloc(u32, layers * width * key_stride);
     errdefer a.free(host_keys);
     const host_counts = try a.alloc(u32, layers * width);
@@ -347,10 +356,19 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
 
 pub fn free(a: std.mem.Allocator, d: *Draft) void {
     const sc = d.scratch;
-    for ([_]cuda.DeviceBuffer{ sc.streams[0], sc.streams[1], sc.positions, sc.write_slots, sc.slots, sc.counts, sc.ids, sc.previous } ++ sc.lists ++ sc.captured) |b| {
+    for ([_]cuda.DeviceBuffer{ sc.streams[0], sc.streams[1], sc.positions, sc.write_slots, sc.slots, sc.counts, sc.ids, sc.previous }) |b| {
         var buf = b;
         buf.free();
     }
+    for (sc.lists, sc.captured) |list, count| {
+        var l = list;
+        l.free();
+        var c = count;
+        c.free();
+    }
+    a.free(sc.lists);
+    a.free(sc.captured);
+    a.free(sc.seq);
     d.kernels.deinit();
     a.free(d.host_keys);
     a.free(d.host_counts);
@@ -359,15 +377,13 @@ pub fn free(a: std.mem.Allocator, d: *Draft) void {
     a.free(d.layers);
 }
 
-/// The row a proposal reads the target's hidden state and recalled lists from: the last row the target kept.
-/// A prompt's own first proposal reads the last row of its final pass, which the capture names for itself.
-pub fn source(d: *const Draft, kept: ?usize) usize {
-    return kept orelse d.scratch.anchor;
+/// The head row a proposal reads the target's hidden state and recalled lists from: the last row the target kept.
+pub fn source(d: *const Draft, slot: usize, kept: ?usize) usize {
+    return if (kept) |k| d.scratch.seq[slot].head0 + k else d.scratch.seq[slot].anchor;
 }
 
-/// `depth` proposals after `anchor` (the last kept pass row's position plus one); the block's own rows go into
-/// the target's caches at `anchor .. anchor + width`, where the verification forward rewrites them.
-pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row: usize, held: []u32) !void {
+/// `depth` proposals after `anchor`; the block's own rows go into the target's caches at `anchor .. anchor + width`.
+pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, depth: u32, row: usize, held: []u32) !void {
     const s = mm.s;
     const k = mm.k;
     const sc = &d.scratch;
@@ -377,17 +393,18 @@ pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row
     const channels = hh * m.value_width;
     std.debug.assert(held.len == depth and depth <= drafts);
     // Positions, write slots and the rotary table for the block's six rows.
+    const base = mm.seqBase(slot);
     var positions: [width * 3]i32 = undefined;
     var writes: [width]u32 = undefined;
     for (0..width) |i| {
         const at: i32 = @intCast(anchor + i);
         positions[i * 3 ..][0..3].* = .{ at, at, at };
-        writes[i] = @intCast(anchor + i);
+        writes[i] = @intCast(base + anchor + i);
     }
     try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(&positions), s.handle);
     try sc.write_slots.uploadAsync(0, std.mem.sliceAsBytes(&writes), s.handle);
     // Each layer's rows attend the target list its own target layer kept for the source row, plus its own prefix.
-    try buildKeys(mm, d, anchor, row);
+    try buildKeys(mm, d, slot, anchor, row);
     try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(d.host_keys), s.handle);
     try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(d.host_counts), s.handle);
     // The block's embeddings: the anchor's row, then five mask rows.
@@ -397,12 +414,7 @@ pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row
     }
     // mtp_fusion on slot 0: the gate's share of eh_proj over [normed anchor, normed target hidden].
     const target_hidden = mm.scratch.head_norm + row * H * 2;
-    // Every norm on this path is the target's own form. `norms.rms` is the **fp32-weight** kernel and these are
-    // the pack's BF16 weights, so each row goes through `addRmsTail`'s tail instead (bf16 weights, MLX's rounded
-    // bf16 steps, which is what the target's layers run) with no residual to add: the residual it writes beside
-    // the row is scratch. Reading a BF16 weight as f32 does not fail — it reads the second half of the row out of
-    // the neighbouring tensor and returns a norm of the right scale and the wrong direction, which is exactly the
-    // 60 % the differential found in this row.
+    // The target's own norm form (`addRmsTail`'s tail, BF16 weights): `norms.rms` reads a BF16 row as f32.
     try k.norms.addRmsTail(s, sc.streams[0].ptr, null, d.enorm, sc.norm_resid, sc.cat, null, 1, H, eps, .{ .round = true });
     try k.norms.addRmsTail(s, target_hidden, null, d.hnorm, sc.norm_resid, sc.cat + H * 2, null, 1, H, eps, .{ .round = true });
     try k.gemm.run(s, sc.cat, d.eh, sc.fused, 1, H, 2 * H, .bf16);
@@ -461,83 +473,84 @@ pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row
     }
     if (d.trail) |t| try t.rows.copyFrom(0, sc.normed, width * H * 2, s.handle);
     // One slot at a time: each row's correction reads the token before it, then the target's own head decides.
-    for (0..depth) |slot| {
-        const token = if (slot == 0) bonus else held[slot - 1];
-        const hidden = sc.normed + (slot + 1) * H * 2; // row 0 is the anchor's own and predicts nothing
+    for (0..depth) |draft_at| {
+        const token = if (draft_at == 0) bonus else held[draft_at - 1];
+        const hidden = sc.normed + (draft_at + 1) * H * 2; // row 0 is the anchor's own and predicts nothing
         try sc.previous.copyFrom(0, mm.embed + @as(u64, token) * H * 2, H * 2, s.handle);
         try k.norms.addRmsTail(s, hidden, null, d.c_hnorm, sc.norm_resid, sc.cat, null, 1, H, eps, .{ .round = true });
         try k.norms.addRmsTail(s, sc.previous.ptr, null, d.c_enorm, sc.norm_resid, sc.cat + H * 2, null, 1, H, eps, .{ .round = true });
-        if (d.trail) |t| if (slot == 0) try t.cat1.copyFrom(0, sc.cat, 2 * H * 2, s.handle);
+        if (d.trail) |t| if (draft_at == 0) try t.cat1.copyFrom(0, sc.cat, 2 * H * 2, s.handle);
         try k.gemm.run(s, sc.cat, d.c_gate, sc.c_gate, 1, H, 2 * H, .bf16);
         try k.gemm.run(s, sc.cat, d.c_up, sc.c_up, 1, H, 2 * H, .bf16);
         try k.act.swiglu(s, sc.c_gate, H, sc.c_up, H, sc.c_act, null, 1, H);
         try k.gemm.run(s, sc.c_act, d.c_down, sc.c_down, 1, H, H, .bf16);
-        if (d.trail) |t| if (slot == 0) try t.delta.copyFrom(0, sc.c_down, H * 2, s.handle);
+        if (d.trail) |t| if (draft_at == 0) try t.delta.copyFrom(0, sc.c_down, H * 2, s.handle);
         try d.kernels.addRows(s, sc.c_down, hidden, sc.corrected, H);
-        if (d.trail) |t| try t.corrected.copyFrom(@as(u64, slot) * H * 2, sc.corrected, H * 2, s.handle);
+        if (d.trail) |t| try t.corrected.copyFrom(@as(u64, draft_at) * H * 2, sc.corrected, H * 2, s.handle);
         switch (mm.lm_head.weight) {
             .bf16 => |w| try k.gemm.run(s, sc.corrected, w, sc.logits, 1, V, H, .f32),
             .exl3 => |w| try k.dense.decode(s, w, sc.corrected, .bf16, 1, sc.logits, .f32),
         }
-        if (d.trail) |t| try t.logits.copyFrom(@as(u64, slot) * V * 4, sc.logits, V * 4, s.handle);
+        if (d.trail) |t| try t.logits.copyFrom(@as(u64, draft_at) * V * 4, sc.logits, V * 4, s.handle);
         try d.kernels.argmaxRows(s, sc.logits, 1, V, sc.ids.ptr);
-        try sc.ids.downloadAsync(0, std.mem.sliceAsBytes(held[slot..][0..1]), s.handle);
+        try sc.ids.downloadAsync(0, std.mem.sliceAsBytes(held[draft_at..][0..1]), s.handle);
         try s.synchronize();
     }
 }
 
-/// One draft row's attended set, the reference's reuse rule: the target's recalled positions below the anchor,
-/// then the block's own causal prefix. A CUDA slot is its position (the indexed layers write by position), so the
-/// two are the same number here, which is what `attention_slots.retained` translates on a paged Metal cache.
-pub fn reuseKeys(anchor: usize, row: usize, target: []const i32, out: []u32) !usize {
+/// One draft row's attended set: the target's recalled slots below the anchor, then the block's own causal prefix.
+pub fn reuseKeys(base: usize, anchor: usize, row: usize, target: []const i32, out: []u32) !usize {
     if (out.len < anchor + row + 1 -| anchor) return error.ShortHy4KeyList;
     var n: usize = 0;
     for (target) |entry| {
         if (entry < 0) continue;
-        const position: usize = @intCast(entry);
-        if (position >= anchor) continue;
+        const slot_index: usize = @intCast(entry);
+        if (slot_index < base) continue; // another sequence's slot
+        if (slot_index - base >= anchor) continue;
         if (n == out.len) return error.ShortHy4KeyList;
-        out[n] = @intCast(position);
+        out[n] = @intCast(slot_index);
         n += 1;
     }
     // The block's own rows, which the like of vLLM pads with -1 past each row's causal prefix.
     for (anchor..anchor + row + 1) |position| {
         if (n == out.len) return error.ShortHy4KeyList;
-        out[n] = @intCast(position);
+        out[n] = @intCast(base + position);
         n += 1;
     }
     return n;
 }
 
 /// A target below its key budget has selected nothing, so a row attends its whole causal history.
-pub fn causalKeys(anchor: usize, row: usize, out: []u32) !usize {
+pub fn causalKeys(base: usize, anchor: usize, row: usize, out: []u32) !usize {
     const at = anchor + row;
     if (out.len < at + 1) return error.ShortHy4KeyList;
-    for (0..at + 1) |position| out[position] = @intCast(position);
+    for (0..at + 1) |position| out[position] = @intCast(base + position);
     return at + 1;
 }
 
-/// A round's key lists on the host, as the reference's reuse kernel builds them: each draft layer's own target
-/// layer's recalled list for the kept row, then that row's own causal prefix.
-fn buildKeys(mm: *Model, d: *Draft, anchor: usize, row_kept: usize) !void {
+/// A round's key lists on the host, as the reference's reuse kernel builds them: each target layer's list for a row.
+fn buildKeys(mm: *Model, d: *Draft, slot: usize, anchor: usize, row_kept: usize) !void {
     const sc = &d.scratch;
-    const captured = sc.selected and row_kept < sc.rows;
+    const q = sc.seq[slot];
+    const captured = q.selected and row_kept < q.keep;
     if (captured) {
-        for (sc.lists, sc.captured, 0..) |list, count, i| {
-            try list.downloadAsync(row_kept * geom.sparse_stride * 4, std.mem.sliceAsBytes(d.host_lists[i * geom.sparse_stride ..][0..geom.sparse_stride]), mm.s.handle);
-            try count.downloadAsync(row_kept * 4, std.mem.sliceAsBytes(d.host_captured[i..][0..1]), mm.s.handle);
+        for (0..layers) |i| {
+            const at_slot = i * sc.seq.len + slot;
+            try sc.lists[at_slot].downloadAsync(row_kept * geom.sparse_stride * 4, std.mem.sliceAsBytes(d.host_lists[i * geom.sparse_stride ..][0..geom.sparse_stride]), mm.s.handle);
+            try sc.captured[at_slot].downloadAsync(row_kept * 4, std.mem.sliceAsBytes(d.host_captured[i..][0..1]), mm.s.handle);
         }
         try mm.s.synchronize();
     }
+    const base = mm.seqBase(slot);
     for (0..layers) |i| {
         // A full 2,048-entry list is the common case past the budget: it and the block's rows just fit the stride.
         const list = d.host_lists[i * geom.sparse_stride ..][0..geom.sparse_stride];
-        for (0..width) |row| {
-            const out = d.host_keys[i * width * key_stride + row * key_stride ..][0..key_stride];
-            d.host_counts[i * width + row] = @intCast(if (captured)
-                try reuseKeys(anchor, row, list[0..@min(@as(usize, d.host_captured[i]), geom.sparse_stride)], out)
+        for (0..width) |r| {
+            const out = d.host_keys[i * width * key_stride + r * key_stride ..][0..key_stride];
+            d.host_counts[i * width + r] = @intCast(if (captured)
+                try reuseKeys(base, anchor, r, list[0..@min(@as(usize, d.host_captured[i]), geom.sparse_stride)], out)
             else
-                try causalKeys(anchor, row, out));
+                try causalKeys(base, anchor, r, out));
         }
     }
 }
@@ -549,7 +562,7 @@ test "a draft row's keys are the reference's reuse list, minus its -1 padding" {
     var out: [key_stride]u32 = undefined;
     var want: [16]i32 = undefined;
     for (0..width) |row| {
-        const n = try reuseKeys(frame.anchor, row, &target, &out);
+        const n = try reuseKeys(0, frame.anchor, row, &target, &out);
         try reference.reuseIndices(frame, &target, 0, @intCast(row), &want);
         var k: usize = 0;
         for (want[0 .. frame.query_rows + target.len]) |entry| if (entry >= 0) {
@@ -561,11 +574,18 @@ test "a draft row's keys are the reference's reuse list, minus its -1 padding" {
         try std.testing.expectEqual(@as(u32, @intCast(frame.anchor + row)), out[n - 1]);
     }
     // Below the key budget the target has selected nothing: the whole causal prefix, and nothing after the row.
-    const dense = try causalKeys(2000, 5, &out);
+    const dense = try causalKeys(0, 2000, 5, &out);
     try std.testing.expectEqual(@as(usize, 2006), dense);
     try std.testing.expectEqual(@as(u32, 2005), out[dense - 1]);
-    try std.testing.expectError(error.ShortHy4KeyList, causalKeys(0, width, out[0..width]));
-    try std.testing.expectError(error.ShortHy4KeyList, reuseKeys(4, 0, &target, out[0..1]));
+    try std.testing.expectError(error.ShortHy4KeyList, causalKeys(0, 0, width, out[0..width]));
+    try std.testing.expectError(error.ShortHy4KeyList, reuseKeys(0, 4, 0, &target, out[0..1]));
+    // A sequence's own base: its slots are its own, and another sequence's entries are not in its set.
+    var mine: [key_stride]u32 = undefined;
+    const other = [_]i32{ 5, 8, 262_150, 262_152 };
+    const held = try reuseKeys(262_144, 8, 1, &other, &mine);
+    try std.testing.expectEqual(@as(usize, 3), held); // its own position 6, then the block's 8 and 9
+    try std.testing.expectEqual(@as(u32, 262_150), mine[0]);
+    try std.testing.expectEqual(@as(u32, 262_153), mine[held - 1]);
 }
 
 test "the block's list fits the stride the attention is sized for" {
