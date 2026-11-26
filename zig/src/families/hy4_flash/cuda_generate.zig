@@ -102,12 +102,13 @@ pub fn main(init: std.process.Init) !void {
     }
     const decode_ns = d0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     try out.writeFile(io, .{ .sub_path = "generated.u32", .data = std.mem.sliceAsBytes(copy.items) });
-    std.debug.print("prompt {d} tokens: prefill {d:.1} ms ({d:.1} tok/s); decode {d} tokens {d:.1} ms/token\ngenerated={any}\n", .{
+    std.debug.print("prompt {d} tokens: prefill {d:.1} ms ({d:.1} tok/s); decode {d} tokens {d:.1} ms/token\nengram rows {d:.1} ms of the prefill\ngenerated={any}\n", .{
         prompt.len,
         @as(f64, @floatFromInt(prefill_ns)) / 1e6,
         @as(f64, @floatFromInt(prompt.len)) * 1e9 / @as(f64, @floatFromInt(prefill_ns)),
         new_tokens,
         @as(f64, @floatFromInt(decode_ns)) / 1e6 / @as(f64, @floatFromInt(@max(new_tokens, 2) - 1)),
+        @as(f64, @floatFromInt(hy4.engram_ns)) / 1e6,
         copy.items,
     });
 }

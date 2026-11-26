@@ -114,6 +114,7 @@ const Layer = struct { engram: ?Engram, attention: Attention, feed: Feed };
 
 pub const Model = struct {
     a: std.mem.Allocator,
+    io: std.Io,
     d: *const cuda.Driver,
     s: cuda.Stream,
     k: *Kernels,
@@ -133,6 +134,8 @@ pub const Model = struct {
     history: std.ArrayList(u32) = .empty,
     expert_scratch: exl3.Shared = .{},
     weight_bytes: usize = 0,
+    /// Host nanoseconds a pass spent on the Engram rows: planning, reading and copying.
+    engram_ns: i96 = 0,
 
     fn tensor(ck: *core.Checkpoint, name: []const u8, dtype: anytype, shape: []const usize) ![]const u8 {
         const t = try ck.get(name);
@@ -172,6 +175,7 @@ pub const Model = struct {
         const self = try a.create(Model);
         self.* = .{
             .a = a,
+            .io = io,
             .d = d,
             .s = s,
             .k = k,
@@ -470,7 +474,9 @@ pub const Model = struct {
         for (self.layers) |*layer| {
             // Engram residual into the streams.
             if (layer.engram) |*e| {
+                const et = std.Io.Clock.awake.now(self.io);
                 try e.table.gather(self.a, windows, raw_rows);
+                self.engram_ns += et.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
                 try sc.e_raw.uploadAsync(0, std.mem.sliceAsBytes(raw_rows), s.handle);
                 const out = sc.streams[(slot + 1) % 3].ptr;
                 try k.engram.forward(s, &k.gemm, e.w, .{
