@@ -115,6 +115,11 @@ pub const Cuda = struct {
     fn pass(self: *Cuda, tokens: []const u32) !void {
         const start = self.m.history.items.len;
         if (start + tokens.len > self.m.capacity) return error.Hy4ContextFull;
+        // The model appends before it forwards: a failed pass leaves the history claiming rows nothing wrote.
+        errdefer {
+            self.m.history.items.len = start;
+            self.kept = false;
+        }
         const t0 = std.Io.Clock.awake.now(self.io);
         try self.m.pass(tokens, self.logits);
         const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
