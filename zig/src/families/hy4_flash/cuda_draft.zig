@@ -415,8 +415,8 @@ pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row
     if (d.trail) |t| try t.carry.copyFrom(0, mm.scratch.head_norm + row * H * 2, H * 2, s.handle);
     // The five layers: each writes its own K/V into the target's cache and reads the target's list.
     const shape = try attn.Shape.init(width, d.heads, key_stride);
-    var res = sc.streams[0].ptr;
-    var spare = sc.streams[1].ptr;
+    const res = sc.streams[0].ptr;
+    const spare = sc.streams[1].ptr;
     try k.norms.addRmsTail(s, res, null, d.layers[0].input_norm, sc.norm_resid, sc.normed, null, width, H, eps, .{ .round = true });
     for (d.layers, 0..) |*l, i| {
         const target = &mm.layers[l.target_kv].attention;
@@ -456,10 +456,8 @@ pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row
         try k.gemm.run(s, sc.ff_inner, l.mlp_down, sc.down, width, H, d.inner, .bf16);
         // The residual, and the next layer's input norm (the block's final norm after the fifth).
         const next_norm = if (i + 1 < d.layers.len) d.layers[i + 1].input_norm else d.final_norm;
+        // Writes the layer's whole output back into `res`; `spare` is free scratch again for the next attention add.
         try k.norms.addRmsTail(s, sc.down, spare, next_norm, res, sc.normed, null, width, H, eps, .{ .round = true });
-        const swap = res;
-        res = spare;
-        spare = swap;
     }
     if (d.trail) |t| try t.rows.copyFrom(0, sc.normed, width * H * 2, s.handle);
     // One slot at a time: each row's correction reads the token before it, then the target's own head decides.
