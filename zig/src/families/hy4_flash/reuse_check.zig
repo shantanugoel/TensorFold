@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     defer s.deinit();
     var kernels = try family.Kernels.load(a, &driver);
     defer kernels.deinit();
-    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity);
+    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, 0, 1);
     defer c.deinit();
     std.debug.print("loaded: {d}-slot context, reuse from row {d}, {d} tokens\n", .{ capacity, from, tokens });
 
@@ -73,11 +73,11 @@ fn arm(c: *family.Cuda, a: std.mem.Allocator, ids: []const u32, reuse: usize, to
     reset(c);
     if (reuse != 0) {
         // The kept caches hold the shared prefix, as a released stream leaves them.
-        const kept = try c.fill(ids[0..reuse], null);
+        const kept = try c.fillIds(ids[0..reuse]);
         if (kept != 0) return error.BadReuseRow;
-        c.kept = true;
+        c.seq[0].kept = true;
     }
-    const from = try c.fill(ids, null);
+    const from = try c.fillIds(ids);
     if (reuse != 0 and from != reuse) {
         std.debug.print("{s}: the fill reused {d} rows, not {d}\n", .{ name, from, reuse });
         return error.ReuseDidNotEngage;
@@ -89,7 +89,7 @@ fn arm(c: *family.Cuda, a: std.mem.Allocator, ids: []const u32, reuse: usize, to
     std.debug.print("{s}: {d} rows reused, {d} prefilled\n", .{ name, from, ids.len - from });
     var token = argmax(c.logits);
     for (0..tokens) |i| {
-        try c.pass(&.{token});
+        try c.pass(0, &.{token});
         @memcpy(rows[(i + 1) * vocab ..][0..vocab], c.logits);
         token = argmax(c.logits);
         drawn[i] = token;
@@ -100,8 +100,7 @@ fn arm(c: *family.Cuda, a: std.mem.Allocator, ids: []const u32, reuse: usize, to
 /// An empty context: no history, no kept prefix, and every layer's cache cleared so neither arm reads the other's rows.
 fn reset(c: *family.Cuda) void {
     c.m.cut(0, 0);
-    c.valid_from = 0;
-    c.kept = false;
+    c.seq[0] = .{};
     for (c.m.layers) |layer| layer.attention.cache.fill8(0, null) catch |e| std.debug.panic("clearing a layer's cache: {s}", .{@errorName(e)});
 }
 

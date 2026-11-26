@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     defer s.deinit();
     var kernels = try family.Kernels.load(a, &driver);
     defer kernels.deinit();
-    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, dfly.drafts);
+    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, dfly.drafts, 1);
     defer c.deinit();
     const m = c.m;
     const V: usize = m.text.vocab_size;
@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // The prompt, then the anchor's own row as the plain path draws it.
-    _ = try c.fill(prompt, null); // a prompt longer than one pass fills in `prompt_rows` chunks
+    _ = try c.fillIds(prompt); // a prompt longer than one pass fills in `prompt_rows` chunks
     const one = try a.alloc(f32, V);
     const block = try a.alloc(f32, rows * V);
     const wide = try a.alloc(f32, rows * V);
@@ -127,8 +127,8 @@ pub fn main(init: std.process.Init) !void {
     var rounds: usize = 0;
     for (0..2) |arm| {
         m.history[0].items.len = prompt.len;
-        c.valid_from = 0;
-        if (arm == 0) _ = try c.fill(prompt, null); // the logits the first draw comes from
+        c.seq[0].valid_from = 0;
+        if (arm == 0) _ = try c.fillIds(prompt); // the logits the first draw comes from
         var pending = argmax(c.logits);
         var prev_kept: usize = 1; // the last kept row of the pass before this round
         for (0..steps) |step| {
@@ -236,7 +236,7 @@ fn traceLayers(a: std.mem.Allocator, c: *family.Cuda, from: usize, first: u32) !
     m.history[0].items.len = from;
     m.trace = .{ .row = 0, .buf = buf, .picks = picks, .scores = scores };
     defer m.trace = null;
-    try c.pass(ids[0..1]);
+    try c.pass(0, ids[0..1]);
     try buf.downloadAsync(0, alone, m.s.handle);
     try picks.downloadAsync(0, alone_picks, m.s.handle);
     try scores.downloadAsync(0, alone_scores, m.s.handle);
@@ -359,7 +359,7 @@ fn dumpRounds(a: std.mem.Allocator, io: std.Io, c: *family.Cuda, prompt: []const
         // chunk's last row instead is a *different* row at BF16 (the pass shape is a wall in its own right, see
         // the note's "What 1.43 was"), and that difference would sit on top of everything this dump measures.
         const last = prompt.len + t - 1; // the prefix without its own last token; t = 0 is the prompt itself
-        _ = try c.fill(prefix[0..last], null);
+        _ = try c.fillIds(prefix[0..last]);
         const only = [1]u32{prefix[last]};
         try m.pass(&only, c.logits);
         const anchor = m.history[0].items.len;
@@ -471,7 +471,7 @@ fn measureRows(a: std.mem.Allocator, c: *family.Cuda, from: usize, positions: us
             for (0..width) |r| {
                 ids[r] = next;
                 const only = [1]u32{next};
-                try c.pass(&only);
+                try c.pass(0, &only);
                 @memcpy(single[r * V ..][0..V], c.logits);
                 next = argmax(c.logits);
             }

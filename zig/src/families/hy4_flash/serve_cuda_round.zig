@@ -105,8 +105,9 @@ pub fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) !void {
         const slot = self.slotOf(r.stream) orelse return error.UnknownHy4Stream;
         self.seq[slot].nheld = 0;
         if (r.depth > dfly.drafts) return error.UnsupportedHy4Window;
-        const anchor = self.m.len(slot);
-        if (r.position != @as(u64, anchor) + 1) return error.InvalidHy4Position;
+        // The anchor is the cache length after this round's keep: a shared round drafts before it cuts the window.
+        if (r.position == 0) return error.InvalidHy4Position;
+        const anchor: usize = @intCast(r.position - 1);
         if (r.depth == 0) continue;
         const kept: ?usize = if (r.rows) |rows| blk: {
             if (rows.len == 0) return error.UnsupportedHy4Window;

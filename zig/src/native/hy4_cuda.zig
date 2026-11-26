@@ -101,7 +101,7 @@ fn refuse(a: Allocator, problem: *[]const u8, comptime fmt: []const u8, args: an
 /// The flags this engine's path cannot serve yet, each with the step that brings it; null when they are all absent.
 fn refusal(a: Allocator, o: api.Open) !?[]const u8 {
     if (o.vision != null) return try std.fmt.allocPrint(a, "--vision: the native Hy4-flash engine reads text only; the width's tower is plan step 7.9, so serve without --vision", .{});
-    if (o.lanes > 1) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves one sequence at a time and queues the rest; serve with --parallel 1 (batching is plan step 7.8's second half)", .{o.lanes});
+    if (o.lanes < 1 or o.lanes > family.max_slots) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves 1 to {d} sequences", .{ o.lanes, family.max_slots });
     if (o.tp != 1 or o.rank != 0) return try std.fmt.allocPrint(a, "--tp {d} --rank {d}: the native Hy4-flash engine is one device (1 and 0)", .{ o.tp, o.rank });
     if (o.kv8) return try std.fmt.allocPrint(a, "--kv-cache fp8: this engine's caches are BF16; 8-bit KV is plan step 7.7", .{});
     if (o.drafter != null or o.mtp_confidence != null) return try std.fmt.allocPrint(a, "--drafter and --mtp-confidence: DFly2 is the pack's own component, so --mtp-drafts {d} names its drafts and no separate checkpoint or confidence head is served", .{family.drafts});
@@ -246,13 +246,14 @@ test "Hy4-flash CUDA host: the context this engine serves: whole pages, the reca
 
 test "Hy4-flash CUDA host: a bare serve is served, and every step this path lacks is refused with its step named" {
     const a = std.testing.allocator;
-    // one sequence, which is what this path serves: requests queue behind it
+    // one sequence, and several: a lane a sequence, from one to the per-slot arrays' width
     const plain: api.Open = .{ .dir = "d", .model_type = model_type, .lanes = 1 };
     try std.testing.expect(try refusal(a, plain) == null);
-    // one flag a request cannot bring yet, and the words name the flag: vision, lanes, an 8-bit cache, a drafter
+    try std.testing.expect(try refusal(a, .{ .dir = "d", .model_type = model_type, .lanes = family.max_slots }) == null);
+    // one flag a request cannot bring yet, and the words name the flag: vision, too many lanes, an 8-bit cache
     for ([_]struct { api.Open, []const u8 }{
         .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .vision = .{} }, "--vision" },
-        .{ .{ .dir = "d", .model_type = model_type, .lanes = 2 }, "--parallel 2" },
+        .{ .{ .dir = "d", .model_type = model_type, .lanes = family.max_slots + 1 }, "--parallel 9" },
         .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .kv8 = true }, "--kv-cache fp8" },
         .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .slide = true }, "--slide" },
     }) |case| {

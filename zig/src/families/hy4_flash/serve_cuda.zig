@@ -233,6 +233,7 @@ pub const Cuda = struct {
     /// The draw a reply starts from, and the one a window row takes: a loaded drafter widens both to its block.
     pub fn facts(self: *const Cuda) lanes.Model {
         const tower = self.m.draft != null;
+        // `streams_exact` is the engine's "may several streams share a forward": each sequence's rows are its own.
         return .{
             .exact_width = if (tower) max_window else 1,
             .mtp = tower,
@@ -241,8 +242,11 @@ pub const Cuda = struct {
             .drafts = if (tower) @intCast(dfly.drafts) else 0,
             .copy_drafts = false,
             .lone_copies = false,
-            .max_streams = 1,
+            .hidden_rows = self.slots > 1,
+            .plain_share = self.slots > 1,
             .streams_exact = true,
+            .batch_rows = @intCast(self.batch_rows),
+            .max_streams = @intCast(self.slots),
         };
     }
 
@@ -308,15 +312,25 @@ pub const Cuda = struct {
         const ids = s.prompt();
         if (ids.len + s.max_new > self.m.capacity) return error.Hy4ContextFull;
         const t0 = std.Io.Clock.awake.now(self.io);
-        const from = try self.fill(s);
+        while (!try self.prefillStep(s, 0)) {}
+        const from = self.seq[self.slotOf(s) orelse return error.NoFreeSlot].from;
         const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
         std.log.debug("hy4-cuda: prompt {d} tokens, {d} reused, {d} prefilled in {d:.1} ms", .{ ids.len, from, ids.len - from, @as(f64, @floatFromInt(ns)) / 1e6 });
     }
 
-    /// `fill`, whole: one prompt's chunks in a row, for a caller with no other stream to serve.
-    pub fn fill(self: *Cuda, s: *lanes.Stream) !usize {
-        while (!try self.prefillStep(s, 0)) {}
-        return self.seq[self.slotOf(s) orelse return error.NoFreeSlot].from;
+    /// `prompt_rows`-row passes of `ids` at sequence 0's caches, resuming the kept shared prefix where it may: a
+    /// tool's whole fill, where a served prompt goes through `prefillStep` a chunk a call.
+    pub fn fillIds(self: *Cuda, ids: []const u32) !usize {
+        if (ids.len == 0) return error.EmptyHy4Prompt;
+        if (ids.len > self.m.capacity) return error.Hy4ContextFull;
+        const from = self.reuseFrom(0, ids);
+        var at = from;
+        while (at < ids.len) {
+            const end = @min(ids.len, at + prompt_rows);
+            try self.pass(0, ids[at..end]);
+            at = end;
+        }
+        return from;
     }
 
     /// One chunk of a prompt: at most `max_rows` rows (0: this engine's own cut), true once the prompt is in.
