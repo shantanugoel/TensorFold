@@ -3,6 +3,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const bf16 = @import("bf16_rows.zig");
 const engram = @import("engram.zig");
+const pass_rows = @import("engram_pass.zig");
 
 test {
     _ = @import("bf16_rows.zig");
@@ -311,4 +312,39 @@ test "openDirect refuses a table whose row count is not the config's for that la
         table.close();
         return error.TestUnexpectedResult;
     }
+}
+
+/// A read-only mock: the parallel path reads from several threads at once, so nothing here may be written.
+const Quiet = struct {
+    bytes: []const u8,
+
+    fn pread(ctx: *anyopaque, _: linux.fd_t, buf: [*]u8, len: usize, off: i64) usize {
+        const self: *Quiet = @ptrCast(@alignCast(ctx));
+        const o: u64 = @bitCast(off);
+        if (o >= self.bytes.len) return 0;
+        const want = @min(len, self.bytes.len - @as(usize, @intCast(o)));
+        @memcpy(buf[0..want], self.bytes[@intCast(o)..][0..want]);
+        return want;
+    }
+};
+
+test "a pass reads every table's rows in parallel and hands them back in layer order" {
+    const a = std.testing.allocator;
+    const data_start: u64 = bf16.alignment - 100;
+    const count: u64 = 32;
+    const bytes = try synth(a, 3 * bf16.alignment, data_start, count);
+    defer a.free(bytes);
+    var quiet: Quiet = .{ .bytes = bytes };
+    const g: bf16.Geometry = .{ .fd = 0, .size = bytes.len, .data_start = data_start, .count = count, .ctx = &quiet, .read = Quiet.pread };
+    var tables = [2]bf16.Table{
+        .{ .geometry = g, .map = fixtureMap(), .hash = fixtureHash() },
+        .{ .geometry = g, .map = fixtureMap(), .hash = fixtureHash() },
+    };
+    var refs = [2]*const bf16.Table{ &tables[0], &tables[1] };
+    const windows = [2][engram.order]u32{ .{ 0, 0, 0 }, .{ 2, 1, 3 } };
+    const io = std.testing.io;
+    var pass = try pass_rows.Rows.start(a, io, &refs, &windows, bf16.tokenElements(), 8);
+    defer pass.close(io);
+    for (0..2) |i| try checkOutput(bytes, data_start, tables[i].map, tables[i].hash, &windows, try pass.next(io));
+    try std.testing.expectError(error.BadEngramRows, pass.next(io));
 }
