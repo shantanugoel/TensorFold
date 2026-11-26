@@ -119,8 +119,10 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     try @import("loader.zig").finishCuda(ck, cfg.value);
     std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
     self.weight_bytes = self.own.bytes;
-    self.scratch = try geom.alloc(self.d, &self.own, self.max_rows, self.text.vocab_size);
-    self.index = try cuda_index.Scratch.init(self.d, self.max_rows, self.capacity);
+    // The indexer's GEMMs keep one row width whatever a pass takes, so it reads that many rows of the model's scratch.
+    const index_rows = if (self.capacity > sparse_stride) geom.row_cap else self.max_rows;
+    self.scratch = try geom.alloc(self.d, &self.own, @max(self.max_rows, index_rows), self.text.vocab_size);
+    self.index = try cuda_index.Scratch.init(self.d, index_rows, self.capacity);
     try reserveDense(self);
     // What grows with the context, so a size decision is read and not inferred: KV, indexer keys, recall scores.
     var kv_bytes: usize = 0;
