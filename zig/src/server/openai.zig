@@ -141,7 +141,7 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
     // a choice's rows or required call would be its own: these alone do not split over n choices
     if (n > 1 and (logprobs != null or sampling.contains("tool_call_required"))) return cx.refuse("n above 1 cannot be served with logprobs or a required tool call");
     if (n > 1 and cortheon.engages(srv, cx.a, raw, is_chat, &input)) return cx.refuse("n above 1 is not served by --cortheon's turn loop: send \"cortheon\": false");
-    const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
+    const thinking = try fields.thinkingFields(cx, body, srv.effort_levels, srv.off_effort);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
     if (thinking.clear) |c| try sampling.put(cx.a, "clear_thinking", .{ .bool = c });

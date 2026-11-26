@@ -205,8 +205,9 @@ fn thinkingSwitch(v: ?Value) ?bool {
 
 pub const Thinking = struct { effort: ?[]const u8 = null, enable: ?bool = null, clear: ?bool = null };
 
-/// ``thinking_fields``: a request's effort and thinking switch where it sets them.
-pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.Refused!Thinking {
+/// ``thinking_fields``: a request's effort and thinking switch where it sets them. `off` is the template's own
+/// thinking-off name (`Server.off_effort`), the only off effort a request may ask for.
+pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8, off: ?[]const u8) errors.Refused!Thinking {
     var out: Thinking = .{};
     const raw = body.get("chat_template_kwargs");
     const kwargs: ?Value = if (raw != null and raw.?.truthy()) raw.? else null;
@@ -223,15 +224,22 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         effort = k.field("reasoning_effort");
     };
     if (effort) |e| {
-        if (e != .string or !isEffort(e.string, levels)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
+        if (e != .string or !isEffort(e.string, levels, off)) return if (off) |name|
+            cx.fail(.request, "reasoning_effort must be none, minimal, low, medium, high, xhigh or max, or {s} for this template's thinking off", .{name})
+        else
+            cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
         out.effort = coerceEffort(e.string, levels);
         // a template's own off name (Hy4-flash's no_think) is thinking off, not a level
-        out.enable = !std.mem.eql(u8, e.string, "none") and !isOffEffort(e.string);
+        out.enable = !std.mem.eql(u8, e.string, "none") and !isOff(e.string, off);
     }
     if (kw_object) if (enable) |on| {
         out.enable = on.truthy();
         if (out.enable.? and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
     };
+    // An off effort is thinking off whatever the switch says: the template keys the block on the effort alone.
+    if (out.effort) |e| {
+        if (isOff(e, off)) out.enable = false;
+    }
     if (top) |on| {
         out.enable = on;
         if (on and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
@@ -243,15 +251,15 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     return out;
 }
 
-fn isEffort(s: []const u8, levels: []const []const u8) bool {
+fn isEffort(s: []const u8, levels: []const []const u8, off: ?[]const u8) bool {
     for (efforts) |e| if (std.mem.eql(u8, e, s)) return true;
     for (levels) |l| if (std.mem.eql(u8, l, s)) return true; // the template's own quoted names
-    return isOffEffort(s);
+    return isOff(s, off);
 }
 
-fn isOffEffort(name: []const u8) bool {
-    for (off_efforts) |o| if (std.mem.eql(u8, o, name)) return true;
-    return false;
+/// `name` is the template's own off effort; another template's off name is not an effort here.
+fn isOff(name: []const u8, off: ?[]const u8) bool {
+    return if (off) |own| std.mem.eql(u8, own, name) else false;
 }
 
 fn order(name: []const u8) ?usize {
@@ -403,7 +411,7 @@ test "efforts and numbers" {
     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
 }
 
-test "a template names its own off switch, and a request names its effort beside or inside the kwargs" {
+test "a template names its own off switch, and a request may ask for that one effort only" {
     const hy4 = "{%- elif reasoning_effort not in ['max', 'high', 'no_think'] %}";
     try std.testing.expectEqualStrings("no_think", offEffort(hy4).?);
     try std.testing.expect(offEffort("{% if enable_thinking %}") == null);
@@ -412,12 +420,25 @@ test "a template names its own off switch, and a request names its effort beside
     const a = arena.allocator();
     const levels = try effortLevels(a, hy4);
     try std.testing.expectEqual(@as(usize, 2), levels.len);
-    const direct = (try json.parseText(a, "{\"reasoning_effort\":\"high\"}")).ok;
-    try std.testing.expectEqualStrings("high", requestedEffort(direct).?);
-    const kwargs = (try json.parseText(a, "{\"chat_template_kwargs\":{\"reasoning_effort\":\"no_think\"}}")).ok;
-    try std.testing.expectEqualStrings("no_think", requestedEffort(kwargs).?);
-    const both = (try json.parseText(a, "{\"reasoning_effort\":\"high\",\"chat_template_kwargs\":{\"reasoning_effort\":\"no_think\"}}")).ok;
-    try std.testing.expectEqualStrings("high", requestedEffort(both).?);
-    const none = (try json.parseText(a, "{\"chat_template_kwargs\":{\"enable_thinking\":false}}")).ok;
-    try std.testing.expect(requestedEffort(none) == null);
+    var cx: Cx = .{ .a = a };
+    const off = offEffort(hy4);
+    // Hy4-flash's own off name is thinking off, and it stays off even beside enable_thinking: true.
+    const asked = (try json.parseText(a, "{\"chat_template_kwargs\":{\"reasoning_effort\":\"no_think\"}}")).ok;
+    const by_kwargs = try thinkingFields(&cx, asked, levels, off);
+    try std.testing.expectEqualStrings("no_think", by_kwargs.effort.?);
+    try std.testing.expectEqual(false, by_kwargs.enable.?);
+    const contradicting = (try json.parseText(a, "{\"reasoning_effort\":\"no_think\",\"chat_template_kwargs\":{\"enable_thinking\":true}}")).ok;
+    try std.testing.expectEqual(false, (try thinkingFields(&cx, contradicting, levels, off)).enable.?);
+    // A level still switches thinking on, and the switch may name it beside the effort.
+    const high = (try json.parseText(a, "{\"reasoning_effort\":\"high\"}")).ok;
+    const on = try thinkingFields(&cx, high, levels, off);
+    try std.testing.expectEqualStrings("high", on.effort.?);
+    try std.testing.expectEqual(true, on.enable.?);
+    const high_off = (try json.parseText(a, "{\"reasoning_effort\":\"no_thinking\"}")).ok;
+    // A template that names no off switch hears another's off name as a bad effort, and names none in its refusal.
+    try std.testing.expectError(error.Refused, thinkingFields(&cx, asked, levels, null));
+    try std.testing.expect(std.mem.indexOf(u8, cx.message, "no_think") == null);
+    // The template that does name it says so, so a client can find the spelling its own template wants.
+    try std.testing.expectError(error.Refused, thinkingFields(&cx, high_off, levels, off));
+    try std.testing.expect(std.mem.indexOf(u8, cx.message, "no_think") != null);
 }
