@@ -175,12 +175,6 @@ pub const Draft = struct {
     host_counts: []u32,
     host_captured: []u32, // a layer's captured count for the source row
     host_lists: []i32,
-
-    /// The weights and scratch the drafter holds, for a load's memory line.
-    pub fn bytes(d: Draft) usize {
-        return d.scratch.streams[0].len + d.scratch.streams[1].len +
-            (d.host_keys.len + d.host_lists.len + d.host_counts.len + d.host_captured.len) * 4;
-    }
 };
 
 fn alloc(d: *const cuda.Driver, len: usize) !cuda.DeviceBuffer {

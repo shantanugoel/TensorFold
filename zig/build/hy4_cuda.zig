@@ -30,6 +30,23 @@ pub fn install(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     b.step("hy4-cuda-generate", "Build the Hy4-flash CUDA greedy generator for EXL3 checkpoints").dependOn(&b.addInstallArtifact(exe, .{}).step);
 }
 
+/// `tf-hy4-cuda-draft`: the DFly2 verify window on a device (one row against the same row inside the block).
+pub fn installDraft(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) void {
+    const root = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/hy4_flash/draft_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    root.addImport("lanes", lanes);
+    root.addImport("cuda", cuda);
+    root.addImport("core", core);
+    root.addImport("engram_hash_core", b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/engram_hash.zig"), .target = target, .optimize = optimize }));
+    root.addImport("config_number", b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/config_number.zig") }));
+    const exe = b.addExecutable(.{ .name = "tf-hy4-cuda-draft", .root_module = root });
+    b.step("hy4-cuda-draft", "Build the Hy4-flash DFly2 verify-window check that needs a device").dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
+
 /// `tf-hy4-cuda-reuse`: the server's prefix reuse against a fresh fill on a device (the caches' two fills must match).
 pub fn installReuse(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) void {
     const root = b.createModule(.{
