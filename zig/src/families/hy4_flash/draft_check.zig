@@ -9,13 +9,17 @@ const family = @import("serve_cuda.zig");
 /// Most blocks a width's KL distribution keeps, for the median and p90 (`POSITIONS` is read up to this).
 const most_blocks = 512;
 
-const usage = "usage: tf-hy4-cuda-draft MODEL_DIR PROMPT.u32 CAPACITY [ROWS] [POSITIONS]\n" ++
+const usage = "usage: tf-hy4-cuda-draft MODEL_DIR PROMPT.u32 CAPACITY [ROWS] [POSITIONS] [TRACE]\n" ++
+    "       tf-hy4-cuda-draft MODEL_DIR PROMPT.u32 CAPACITY dump DIR CONT.u32 N\n" ++
     "  PROMPT.u32  little-endian u32 token ids\n" ++
     "  CAPACITY    the context the model keeps, in slots (past 2,048 the indexer runs too)\n" ++
     "  ROWS        the verify window's rows (default 6)\n" ++
     "  POSITIONS   instead of the round checks, measure the row count: that many rows a window width,\n" ++
     "              every row against the same row fed one at a time (KL, top-1, max |delta logit|)\n" ++
-    "  TRACE       1: also compare one row's hidden state after every layer, two ways, to place a difference\n";
+    "  TRACE       1: also compare one row's hidden state after every layer, two ways, to place a difference\n" ++
+    "  dump        the same-input differential: for t = 0..N-1 a round from PROMPT + CONT's first t tokens,\n" ++
+    "              dumping the fused anchor row, the block's final-normed rows, each slot's corrected hidden\n" ++
+    "              and logits row, and the verify pass's own rows, to DIR/round-{t}.bin\n";
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -28,9 +32,11 @@ pub fn main(init: std.process.Init) !void {
     const dir = args[1];
     const prompt = try readIds(a, io, args[2]);
     const capacity = try std.fmt.parseInt(usize, args[3], 10);
-    const rows: usize = if (args.len > 4) try std.fmt.parseInt(usize, args[4], 10) else dfly.width;
-    const positions: usize = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 0;
-    const trace: bool = if (args.len > 6) (try std.fmt.parseInt(u32, args[6], 10)) != 0 else false;
+    const dumps: bool = args.len > 4 and std.mem.eql(u8, args[4], "dump");
+    const rows: usize = if (!dumps and args.len > 4) try std.fmt.parseInt(usize, args[4], 10) else dfly.width;
+    const positions: usize = if (!dumps and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 0;
+    const trace: bool = if (!dumps and args.len > 6) (try std.fmt.parseInt(u32, args[6], 10)) != 0 else false;
+    if (dumps and args.len < 8) return error.BadArgs;
     if (prompt.len < 8 or rows < 2 or rows > dfly.width) return error.BadArgs;
 
     var driver = try cuda.Driver.open();
@@ -48,6 +54,11 @@ pub fn main(init: std.process.Init) !void {
     const V: usize = m.text.vocab_size;
     const dr = &m.draft.?;
     std.debug.print("loaded: {d}-slot context, {d}-row window, prompt {d} tokens\n", .{ capacity, rows, prompt.len });
+
+    if (dumps) {
+        try dumpRounds(a, io, c, prompt, args[5], args[6], try std.fmt.parseInt(usize, args[7], 10));
+        return;
+    }
 
     // The prompt, then the anchor's own row as the plain path draws it.
     _ = try c.fill(prompt, null); // a prompt longer than one pass fills in `prompt_rows` chunks
@@ -282,6 +293,141 @@ fn traceLayers(a: std.mem.Allocator, c: *family.Cuda, from: usize, first: u32) !
         std.debug.print("  layer {d:>2}: {d} of {d} picks differ; |score(chosen) - score(other)| {d:.6} alone, {d:.6} in the window\n", .{ l, apart, geom_k, gap_alone, gap_window });
     }
     std.debug.print("  {d} of {d} routed layers pick a different expert set at row 0\n", .{ differs, layers });
+}
+
+/// The same-input differential: `count` rounds, round t from `prompt` + the continuation's first t tokens, each
+/// proposed and then verified, with everything a comparison against another engine needs written to
+/// `dir/round-{t}.bin`: a magic word, seven header words, then the arrays in the order the header names them.
+///
+/// The prefix is the plain greedy continuation, so both engines see the same ids and the same target state and what
+/// differs between them is the tower. A round's own draw is dumped beside the teacher's token: a round the engine
+/// drew something else at is one the other engine reached from a different anchor, and the reader can drop it.
+fn dumpRounds(a: std.mem.Allocator, io: std.Io, c: *family.Cuda, prompt: []const u32, dir: []const u8,
+              cont_path: []const u8, count: usize) !void {
+    const m = c.m;
+    const V: usize = m.text.vocab_size;
+    const dr = &m.draft.?;
+    const cont = try readIds(a, io, cont_path);
+    if (cont.len < count + dfly.drafts) return error.BadPrompt;
+    const H = @import("cuda_scratch.zig").H;
+    var trail: dfly.Trail = .{
+        .fused = try cuda.DeviceBuffer.alloc(m.d, H * 2),
+        .carry = try cuda.DeviceBuffer.alloc(m.d, H * 2),
+        .cat = try cuda.DeviceBuffer.alloc(m.d, 2 * H * 2),
+        .proj = try cuda.DeviceBuffer.alloc(m.d, H * 2),
+        .cat1 = try cuda.DeviceBuffer.alloc(m.d, 2 * H * 2),
+        .delta = try cuda.DeviceBuffer.alloc(m.d, H * 2),
+        .rows = try cuda.DeviceBuffer.alloc(m.d, dfly.width * H * 2),
+        .corrected = try cuda.DeviceBuffer.alloc(m.d, dfly.drafts * H * 2),
+        .logits = try cuda.DeviceBuffer.alloc(m.d, dfly.drafts * V * 4),
+    };
+    defer {
+        trail.fused.free();
+        trail.carry.free();
+        trail.cat.free();
+        trail.proj.free();
+        trail.cat1.free();
+        trail.delta.free();
+        trail.rows.free();
+        trail.corrected.free();
+        trail.logits.free();
+    }
+    dr.trail = &trail;
+    defer dr.trail = null;
+    const fused = try a.alloc(u8, H * 2);
+    const carry = try a.alloc(u8, H * 2);
+    const cat = try a.alloc(u8, 2 * H * 2);
+    const proj = try a.alloc(u8, H * 2);
+    const cat1 = try a.alloc(u8, 2 * H * 2);
+    const delta = try a.alloc(u8, H * 2);
+    const rows_host = try a.alloc(u8, dfly.width * H * 2);
+    const corrected = try a.alloc(u8, dfly.drafts * H * 2);
+    const logits_host = try a.alloc(u8, dfly.drafts * V * 4);
+    const verify = try a.alloc(f32, dfly.width * V);
+    const block = try a.alloc(f32, dfly.width * V);
+    var bytes: std.ArrayList(u8) = .empty;
+    var ids: [dfly.width]u32 = @splat(dr.mask);
+    var held: [dfly.drafts]u32 = @splat(0);
+    const prefix = try a.alloc(u32, prompt.len + count + 1);
+    var accepted: usize = 0;
+    var slot_ok: [dfly.drafts]usize = @splat(0);
+    for (0..count) |t| {
+        @memcpy(prefix[0..prompt.len], prompt);
+        @memcpy(prefix[prompt.len..][0..t], cont[0..t]);
+        // The other engine's shape, exactly: its Generator prefills the prefix without its last token and decodes
+        // that one as a single row, so the carry this round fuses comes from a 1-row pass here too. A prefill
+        // chunk's last row instead is a *different* row at BF16 (the pass shape is a wall in its own right, see
+        // the note's "What 1.43 was"), and that difference would sit on top of everything this dump measures.
+        const last = prompt.len + t - 1; // the prefix without its own last token; t = 0 is the prompt itself
+        _ = try c.fill(prefix[0..last], null);
+        const only = [1]u32{prefix[last]};
+        try m.pass(&only, c.logits);
+        const anchor = m.history.items.len;
+        const drawn = argmax(c.logits);
+        const bonus = cont[t]; // teacher: the continuation's own token, whether or not this engine drew it
+        try dfly.propose(m, dr, anchor, bonus, dfly.drafts, dfly.source(dr, null), &held);
+        ids[0] = bonus;
+        for (0..dfly.drafts) |i| ids[1 + i] = held[i];
+        try m.passRows(ids[0..], c.logits, .{ .at = 0, .out = block[0 .. dfly.width * V], .head = dfly.width });
+        @memcpy(verify, block);
+        m.history.items.len = anchor;
+        try trail.fused.downloadAsync(0, fused, m.s.handle);
+        try trail.carry.downloadAsync(0, carry, m.s.handle);
+        try trail.cat.downloadAsync(0, cat, m.s.handle);
+        try trail.proj.downloadAsync(0, proj, m.s.handle);
+        try trail.cat1.downloadAsync(0, cat1, m.s.handle);
+        try trail.delta.downloadAsync(0, delta, m.s.handle);
+        try trail.rows.downloadAsync(0, rows_host, m.s.handle);
+        try trail.corrected.downloadAsync(0, corrected, m.s.handle);
+        try trail.logits.downloadAsync(0, logits_host, m.s.handle);
+        try m.s.synchronize();
+        // Proposals against the continuation's own next tokens: the number the other engine's rounds give.
+        var line: [dfly.drafts]u8 = @splat('.');
+        for (0..dfly.drafts) |i| {
+            if (held[i] == cont[t + 1 + i]) {
+                line[i] = '#';
+                slot_ok[i] += 1;
+            }
+        }
+        accepted += std.mem.count(u8, &line, "#");
+        std.debug.print("round {d}: anchor {d} bonus {d} (this engine drew {d}), proposals {any}, continuation {any} {s}, verify rows {any}\n", .{
+            t, anchor, bonus, drawn, held, cont[t + 1 ..][0..dfly.drafts], line, block0(block, V, dfly.width),
+        });
+        bytes.clearRetainingCapacity();
+        for ([_]u32{ 0x344c4648, @intCast(anchor), bonus, drawn, dfly.width, dr.mask }) |word| try appendWord(&bytes, a, word);
+        for (held) |h| try appendWord(&bytes, a, h);
+        try bytes.appendSlice(a, fused);
+        try bytes.appendSlice(a, carry);
+        try bytes.appendSlice(a, cat);
+        try bytes.appendSlice(a, proj);
+        try bytes.appendSlice(a, cat1);
+        try bytes.appendSlice(a, delta);
+        try bytes.appendSlice(a, rows_host);
+        try bytes.appendSlice(a, corrected);
+        try bytes.appendSlice(a, logits_host);
+        try bytes.appendSlice(a, std.mem.sliceAsBytes(verify));
+        var name: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&name, "{s}/round-{d}.bin", .{ dir, t });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes.items });
+    }
+    std.debug.print("teacher rounds: {d} of {d} proposals matched over {d} rounds ({d:.2} a round); by slot", .{
+        accepted, count * dfly.drafts, count, @as(f64, @floatFromInt(accepted)) / @as(f64, @floatFromInt(@max(count, 1))),
+    });
+    for (slot_ok, 0..) |n, i| std.debug.print(" {d}: {d:.2}", .{ i + 1, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(@max(count, 1))) });
+    std.debug.print("\n", .{});
+}
+
+fn appendWord(list: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, word, .little);
+    try list.appendSlice(a, &buf);
+}
+
+/// Every row's argmax of a `rows`-row block of logits.
+fn block0(logits: []const f32, V: usize, rows: usize) [dfly.width]u32 {
+    var out: [dfly.width]u32 = undefined;
+    for (0..rows) |r| out[r] = argmax(logits[r * V ..][0..V]);
+    return out;
 }
 
 fn readF32(bytes: []const u8, i: usize) f32 {

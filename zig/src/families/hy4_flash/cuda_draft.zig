@@ -109,6 +109,7 @@ pub const Kernels = struct {
 pub const Scratch = struct {
     streams: [2]cuda.DeviceBuffer, // the block's residual, BF16 [width, hidden], rotated
     normed: u64, // BF16 [width, hidden]: a layer's input norm, and the block's final-normed rows
+    norm_resid: u64, // BF16 [width, hidden]: what a norm-only call leaves as its residual (never read)
     q_raw: u64, // BF16 [width, q_lora_rank]
     q_tmp: u64,
     q_resid: u64,
@@ -150,6 +151,21 @@ pub const Scratch = struct {
     selected: bool = false,
 };
 
+/// One round's interior, for the same-input differential against another engine (`draft_check.zig`'s dump mode):
+/// the fused anchor row, the block's six final-normed rows, and each slot's corrected hidden and logits row.
+/// A harness reads it; a served round leaves `trail` null and pays nothing.
+pub const Trail = struct {
+    fused: cuda.DeviceBuffer, // BF16 [H]: row 0 after the fusion
+    carry: cuda.DeviceBuffer, // BF16 [H]: the target's post-final-norm row the fusion read
+    cat: cuda.DeviceBuffer, // BF16 [2H]: the fusion's [normed anchor, normed carry]
+    proj: cuda.DeviceBuffer, // BF16 [H]: eh_proj of that, before the gate
+    rows: cuda.DeviceBuffer, // BF16 [width, H]
+    corrected: cuda.DeviceBuffer, // BF16 [width - 1, H]
+    cat1: cuda.DeviceBuffer, // BF16 [2H]: the first slot's correction concat
+    delta: cuda.DeviceBuffer, // BF16 [H]: the first slot's down_proj output
+    logits: cuda.DeviceBuffer, // F32 [width - 1, vocab]
+};
+
 pub const Draft = struct {
     layers: []Layer,
     inner: usize,
@@ -175,6 +191,8 @@ pub const Draft = struct {
     host_counts: []u32,
     host_captured: []u32, // a layer's captured count for the source row
     host_lists: []i32,
+    /// Set by a harness that wants one round's interior; null in service.
+    trail: ?*Trail = null,
 };
 
 fn alloc(d: *const cuda.Driver, len: usize) !cuda.DeviceBuffer {
@@ -259,6 +277,7 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
     var sc: Scratch = undefined;
     for (&sc.streams) |*b| b.* = try alloc(d, width * H * 2);
     sc.normed = try zeros(d, width * H * 2);
+    sc.norm_resid = try zeros(d, width * H * 2);
     sc.q_raw = try zeros(d, width * Q * 2);
     sc.q_tmp = try zeros(d, width * Q * 2);
     sc.q_resid = try zeros(d, width * Q * 2);
@@ -378,15 +397,27 @@ pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row
     }
     // mtp_fusion on slot 0: the gate's share of eh_proj over [normed anchor, normed target hidden].
     const target_hidden = mm.scratch.head_norm + row * H * 2;
-    try k.norms.rms(s, sc.streams[0].ptr, .bf16, d.enorm, sc.cat, .bf16, 1, H, eps);
-    try k.norms.rms(s, target_hidden, .bf16, d.hnorm, sc.cat + H * 2, .bf16, 1, H, eps);
+    // Every norm on this path is the target's own form. `norms.rms` is the **fp32-weight** kernel and these are
+    // the pack's BF16 weights, so each row goes through `addRmsTail`'s tail instead (bf16 weights, MLX's rounded
+    // bf16 steps, which is what the target's layers run) with no residual to add: the residual it writes beside
+    // the row is scratch. Reading a BF16 weight as f32 does not fail — it reads the second half of the row out of
+    // the neighbouring tensor and returns a norm of the right scale and the wrong direction, which is exactly the
+    // 60 % the differential found in this row.
+    try k.norms.addRmsTail(s, sc.streams[0].ptr, null, d.enorm, sc.norm_resid, sc.cat, null, 1, H, eps, .{ .round = true });
+    try k.norms.addRmsTail(s, target_hidden, null, d.hnorm, sc.norm_resid, sc.cat + H * 2, null, 1, H, eps, .{ .round = true });
     try k.gemm.run(s, sc.cat, d.eh, sc.fused, 1, H, 2 * H, .bf16);
+    if (d.trail) |t| {
+        try t.cat.copyFrom(0, sc.cat, 2 * H * 2, s.handle);
+        try t.proj.copyFrom(0, sc.fused, H * 2, s.handle);
+    }
     try d.kernels.fuseRow(s, sc.streams[0].ptr, sc.fused, d.fuse_gate, sc.streams[0].ptr, H);
+    if (d.trail) |t| try t.fused.copyFrom(0, sc.streams[0].ptr, H * 2, s.handle);
+    if (d.trail) |t| try t.carry.copyFrom(0, mm.scratch.head_norm + row * H * 2, H * 2, s.handle);
     // The five layers: each writes its own K/V into the target's cache and reads the target's list.
     const shape = try attn.Shape.init(width, d.heads, key_stride);
     var res = sc.streams[0].ptr;
     var spare = sc.streams[1].ptr;
-    try k.norms.rms(s, res, .bf16, d.layers[0].input_norm, sc.normed, .bf16, width, H, eps);
+    try k.norms.addRmsTail(s, res, null, d.layers[0].input_norm, sc.norm_resid, sc.normed, null, width, H, eps, .{ .round = true });
     for (d.layers, 0..) |*l, i| {
         const target = &mm.layers[l.target_kv].attention;
         const slots = sc.slots.ptr + @as(u64, i) * width * key_stride * 4;
@@ -430,22 +461,27 @@ pub fn propose(mm: *Model, d: *Draft, anchor: usize, bonus: u32, depth: u32, row
         res = spare;
         spare = swap;
     }
+    if (d.trail) |t| try t.rows.copyFrom(0, sc.normed, width * H * 2, s.handle);
     // One slot at a time: each row's correction reads the token before it, then the target's own head decides.
     for (0..depth) |slot| {
         const token = if (slot == 0) bonus else held[slot - 1];
         const hidden = sc.normed + (slot + 1) * H * 2; // row 0 is the anchor's own and predicts nothing
         try sc.previous.copyFrom(0, mm.embed + @as(u64, token) * H * 2, H * 2, s.handle);
-        try k.norms.rms(s, hidden, .bf16, d.c_hnorm, sc.cat, .bf16, 1, H, eps);
-        try k.norms.rms(s, sc.previous.ptr, .bf16, d.c_enorm, sc.cat + H * 2, .bf16, 1, H, eps);
+        try k.norms.addRmsTail(s, hidden, null, d.c_hnorm, sc.norm_resid, sc.cat, null, 1, H, eps, .{ .round = true });
+        try k.norms.addRmsTail(s, sc.previous.ptr, null, d.c_enorm, sc.norm_resid, sc.cat + H * 2, null, 1, H, eps, .{ .round = true });
+        if (d.trail) |t| if (slot == 0) try t.cat1.copyFrom(0, sc.cat, 2 * H * 2, s.handle);
         try k.gemm.run(s, sc.cat, d.c_gate, sc.c_gate, 1, H, 2 * H, .bf16);
         try k.gemm.run(s, sc.cat, d.c_up, sc.c_up, 1, H, 2 * H, .bf16);
         try k.act.swiglu(s, sc.c_gate, H, sc.c_up, H, sc.c_act, null, 1, H);
         try k.gemm.run(s, sc.c_act, d.c_down, sc.c_down, 1, H, H, .bf16);
+        if (d.trail) |t| if (slot == 0) try t.delta.copyFrom(0, sc.c_down, H * 2, s.handle);
         try d.kernels.addRows(s, sc.c_down, hidden, sc.corrected, H);
+        if (d.trail) |t| try t.corrected.copyFrom(@as(u64, slot) * H * 2, sc.corrected, H * 2, s.handle);
         switch (mm.lm_head.weight) {
             .bf16 => |w| try k.gemm.run(s, sc.corrected, w, sc.logits, 1, V, H, .f32),
             .exl3 => |w| try k.dense.decode(s, w, sc.corrected, .bf16, 1, sc.logits, .f32),
         }
+        if (d.trail) |t| try t.logits.copyFrom(@as(u64, slot) * V * 4, sc.logits, V * 4, s.handle);
         try d.kernels.argmaxRows(s, sc.logits, 1, V, sc.ids.ptr);
         try sc.ids.downloadAsync(0, std.mem.sliceAsBytes(held[slot..][0..1]), s.handle);
         try s.synchronize();
