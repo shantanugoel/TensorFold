@@ -166,13 +166,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
     const bytes = h.c.bytes();
     const avail = family.memAvailable();
-    if (avail < floor_gib << 30) {
-        const over = (floor_gib << 30) - avail;
-        const per_token = family.bytesPerToken(h.c.m);
-        if (per_token == 0 or over / per_token >= capacity) return refuse(a, problem, "a {d}-token context leaves {d:.2} GiB of MemAvailable, {d:.2} GiB under the {d} GiB floor: even {d} tokens would not fit now", .{ capacity, gib(avail), gib(over), floor_gib, least_context });
-        const slack = @max(capacity - @as(u32, @intCast(over / per_token)), least_context);
-        return refuse(a, problem, "a {d}-token context leaves {d:.2} GiB of MemAvailable, {d:.2} GiB under the {d} GiB floor: serve --context {d} or less", .{ capacity, gib(avail), gib(over), floor_gib, slack / 512 * 512 });
-    }
+    if (avail < floor_gib << 30) return refuse(a, problem, "{s}", .{try floorRefusal(a, capacity, family.bytesPerToken(h.c.m), avail, floor_gib)});
     h.cfg = try lanes.Config.init(gpa, family.Cuda.facts(), family.max_window, 0);
     errdefer h.cfg.deinit(gpa);
     h.clock = .{ .io = io };
@@ -211,7 +205,17 @@ fn gib(bytes: anytype) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1 << 30);
 }
 
-test "the context this engine serves: whole pages, the recall scores' width, and clear words past it" {
+/// What a load over the post-load floor says: the context that would fit, in pages and never below the smallest served.
+fn floorRefusal(a: Allocator, capacity: u32, per_token: u64, avail: u64, floor_gib: u64) ![]const u8 {
+    const over = (floor_gib << 30) - avail;
+    const fits = if (per_token == 0) capacity else @min(over / per_token, capacity);
+    const under = "a {d}-token context leaves {d:.2} GiB of MemAvailable, {d:.2} GiB under the {d} GiB floor: ";
+    if (fits >= capacity) return std.fmt.allocPrint(a, under ++ "even {d} tokens would not fit now", .{ capacity, gib(avail), gib(over), floor_gib, least_context });
+    const slack = @max(capacity - @as(u32, @intCast(fits)), least_context);
+    return std.fmt.allocPrint(a, under ++ "serve --context {d} or less", .{ capacity, gib(avail), gib(over), floor_gib, slack / 512 * 512 });
+}
+
+test "Hy4-flash CUDA host: the context this engine serves: whole pages, the recall scores' width, and clear words past it" {
     const a = std.testing.allocator;
     var problem: []const u8 = "";
     defer if (problem.len > 0) a.free(problem);
@@ -219,4 +223,55 @@ test "the context this engine serves: whole pages, the recall scores' width, and
     try std.testing.expectEqual(@as(?u32, 131_072), try contextOf(a, .{ .dir = "d", .model_type = model_type, .context = 131000 }, &problem));
     try std.testing.expectEqual(@as(?u32, null), try contextOf(a, .{ .dir = "d", .model_type = model_type, .context = 524_288 }, &problem));
     try std.testing.expect(std.mem.indexOf(u8, problem, "262144") != null);
+}
+
+test "Hy4-flash CUDA host: a bare serve is served, and every step this path lacks is refused with its step named" {
+    const a = std.testing.allocator;
+    // one sequence, which is again what the server's own flags give it (a bare Open's --parallel default is 8)
+    const plain: api.Open = .{ .dir = "d", .model_type = model_type, .lanes = 1 };
+    try std.testing.expect(try refusal(a, plain) == null);
+    // one flag a request cannot bring yet, and the words name the flag: vision, lanes, an 8-bit cache, a drafter
+    for ([_]struct { api.Open, []const u8 }{
+        .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .vision = .{} }, "--vision" },
+        .{ .{ .dir = "d", .model_type = model_type, .lanes = 2 }, "--parallel 2" },
+        .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .kv8 = true }, "--kv-cache fp8" },
+        .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .slide = true }, "--slide" },
+    }) |case| {
+        const why = (try refusal(a, case[0])).?;
+        defer a.free(why);
+        try std.testing.expect(std.mem.indexOf(u8, why, case[1]) != null);
+    }
+}
+
+test "Hy4-flash CUDA host: a request this engine cannot serve says which part it cannot take" {
+    const a = std.testing.allocator;
+    var out: [512]u8 = undefined;
+    const plain: api.Request = .{ .prompt = &.{}, .max_tokens = 1 };
+    try std.testing.expect(refusalMessage(undefined, &plain, &out) == null);
+    const one: [1]lanes.stream.Image = .{.{ .pixels = &.{}, .gh = 1, .gw = 1, .at = 0, .tokens = 1 }};
+    const image: api.Request = .{ .prompt = &.{}, .max_tokens = 1, .images = &one };
+    var problem = refusalMessage(undefined, &image, &out).?;
+    try std.testing.expect(std.mem.startsWith(u8, problem, "the Hy4-flash CUDA engine reads text only"));
+    const tools: api.Request = .{ .prompt = &.{}, .max_tokens = 1, .tools_json = "[]" };
+    problem = refusalMessage(undefined, &tools, &out).?;
+    try std.testing.expect(std.mem.startsWith(u8, problem, "the Hy4-flash CUDA engine does not serve tools"));
+    _ = a;
+}
+
+test "Hy4-flash CUDA host: the post-load floor names the context that fits, in whole pages and never below the least" {
+    const a = std.testing.allocator;
+    const per_token: u64 = 18_688; // v3a's growing caches at 262,144 slots, from the family's own accounting
+    const floor: u64 = 8; // GiB, as TF_HY4_SERVE_FLOOR_GIB reads it
+    // 0.5 GiB under the floor: about 28,727 tokens' worth, so 233,417 slots fit, rounded down to whole pages.
+    const short = try floorRefusal(a, 262_144, per_token, (7 << 30) + (1 << 29), floor);
+    defer a.free(short);
+    try std.testing.expect(std.mem.indexOf(u8, short, "serve --context 232960 or less") != null);
+    // A context far too large to rescue by shrinking it: 5 GiB short is more than the whole context's caches.
+    const hopeless = try floorRefusal(a, 262_144, per_token, 3 << 30, floor);
+    defer a.free(hopeless);
+    try std.testing.expect(std.mem.indexOf(u8, hopeless, "even 4096 tokens would not fit now") != null);
+    // The clamp: a deficit that would leave less than this engine serves suggests the least it serves, not less.
+    const tight = try floorRefusal(a, 262_144, per_token, (floor << 30) - 261_000 * per_token, floor);
+    defer a.free(tight);
+    try std.testing.expect(std.mem.indexOf(u8, tight, "serve --context 4096 or less") != null);
 }

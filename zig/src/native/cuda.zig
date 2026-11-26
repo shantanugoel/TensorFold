@@ -554,6 +554,7 @@ test "Flash Next takes --vision at family admission" {
     try @import("cuda_flashnext_refusal_test.zig").vision();
 }
 test {
+    _ = @import("hy4_cuda.zig"); // its tests run under test-hy4-cuda-host's filter
     _ = @import("cuda_health_test.zig");
     _ = @import("cuda_ceiling_test.zig");
     _ = @import("cuda_vision_offer.zig");

@@ -327,6 +327,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-nemotron-wide-walk-host", "A 32-row Nemotron wide round through every row limit, without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{ "wide round walk:", "wide rounds:" } })).step);
     @import("rows_host.zig").tests(b, native_modules.api, step);
     const native = native_modules.engines;
+    // Hy4-flash CUDA's own host: the flags it cannot serve, its floor's words and the context it serves
+    b.step("test-hy4-cuda-host", "Hy4-flash CUDA host: request refusals, the post-load floor's words, the served context").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"Hy4-flash CUDA host:"} })).step);
     const prompt_rows = b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{ "CUDA startup:", "Qwen prompt rows:", "slide admission: cuda" } }));
     prompt_rows.has_side_effects = true;
     b.step("test-qwen35-prompt-rows-host", "Loaded Qwen prompt rows and unchanged planned cache behavior without devices").dependOn(&prompt_rows.step);
