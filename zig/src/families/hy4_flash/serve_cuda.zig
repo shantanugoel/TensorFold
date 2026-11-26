@@ -40,9 +40,11 @@ pub fn memAvailable() u64 {
     return @import("cuda_load_util.zig").memAvailable();
 }
 
-/// Per-token cache bytes a context of `capacity` slots takes at `layers`, for a size decision taken before a load.
-pub fn bytesPerToken(indexed: usize) u64 {
-    return indexed * (mla.absorbed_stride * 2 + 320);
+/// Per-token cache bytes the model's own caches take at its capacity: the KV of the layers that keep all of it, their
+/// indexer's keys and the recall scores. The ring is flat, so it takes no part in a size decision.
+pub fn bytesPerToken(m: *const model.Model) u64 {
+    const b = cacheBytes(m);
+    return (b.kv + b.index + b.scores) / @max(@as(u64, m.capacity), 1);
 }
 
 pub const Cuda = struct {
@@ -315,15 +317,38 @@ test "a logit rounds to the bf16 word the head would write, ties to even" {
 
 test "a context's caches split into the KV that grows, the ring that does not and the indexer's keys" {
     // The shape v3a loads with, from the family's own geometry: 30 sliding layers, 12 indexed ones.
-    const indexed: usize = 12;
-    const per_token = bytesPerToken(indexed);
-    try std.testing.expectEqual(@as(u64, 12 * (1152 + 320)), per_token);
-    const at_262144 = per_token * 262144;
-    try std.testing.expect(at_262144 > 4 << 30 and at_262144 < 5 << 30);
+    var buf: [1024]u8 align(8) = undefined; // a stand-in for the indexer's device-side layers: only the keys' sizes are read
+    var indexers: [12]@import("cuda_index.zig").Layer = undefined;
+    for (&indexers) |*ix| {
+        ix.* = undefined;
+        ix.token_keys = .{ .d = undefined, .ptr = @intFromPtr(&buf), .len = 262_144 * 128 * 2, .owner = null, .borrowed = true };
+        ix.group_keys = .{ .d = undefined, .ptr = @intFromPtr(&buf), .len = 65_536 * 128 * 2, .owner = null, .borrowed = true };
+    }
+    var layers: [42]model.Layer = undefined;
+    for (&layers, 0..) |*layer, i| {
+        const sliding = i < 30;
+        var att: model.Attention = undefined;
+        att.sliding = sliding;
+        att.rows = if (sliding) ring_rows else 262_144;
+        att.index = if (sliding) null else &indexers[i - 30];
+        layer.* = .{ .attention = att, .engram = null, .feed = undefined };
+    }
+    // 12 indexed layers: the recall scores' width is 65,536 groups, so 1,024 scores a token.
+    const scores: usize = 1024 * 65_536 * 4;
+    var m: model.Model = undefined;
+    m.layers = &layers;
+    m.capacity = 262_144;
+    m.index.scores = .{ .d = undefined, .ptr = 0, .len = scores, .owner = null, .borrowed = false };
+    const b = cacheBytes(&m);
+    try std.testing.expectEqual(@as(u64, 12 * 262_144 * 1152), b.kv);
+    try std.testing.expectEqual(@as(u64, 12 * 83_886_080), b.index);
     // The ring is flat: 30 layers of 1,536 slots of 576 bf16 words.
     const ring: u64 = 30 * ring_rows * 576 * 2;
+    try std.testing.expectEqual(ring, b.ring);
     try std.testing.expectEqual(@as(u64, 53_084_160), ring);
     try std.testing.expect(ring_window == 512 and ring_rows == 3 * ring_window);
+    // A size decision's rate counts everything that grows: 13,824 B of KV, 3,840 B of indexer keys, 1,024 B of scores.
+    try std.testing.expectEqual(@as(u64, 18_688), bytesPerToken(&m));
 }
 
 test "a rewind is allowed exactly while the ring still holds the rows its first window reads" {

@@ -152,50 +152,29 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const h = try gpa.create(Owned);
     errdefer gpa.destroy(h);
     h.gpa = gpa;
-    h.driver = cuda.Driver.open() catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
-        return null;
-    };
+    h.driver = cuda.Driver.open() catch |e| return refuse(a, problem, "no CUDA driver ({s})", .{@errorName(e)});
     errdefer h.driver.close();
-    const count = h.driver.deviceCount() catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "cannot read the CUDA device count ({s})", .{@errorName(e)});
-        return null;
-    };
-    if (device >= count) {
-        problem.* = try std.fmt.allocPrint(a, "--device {d}: this machine has {d} CUDA device{s} (0 to {d})", .{ device, count, if (count == 1) "" else "s", @max(count, 1) - 1 });
-        return null;
-    }
-    h.ctx = cuda.Context.init(&h.driver, @intCast(device)) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "cannot open CUDA device {d} ({s})", .{ device, @errorName(e) });
-        return null;
-    };
+    const count = h.driver.deviceCount() catch |e| return refuse(a, problem, "cannot read the CUDA device count ({s})", .{@errorName(e)});
+    if (device >= count) return refuse(a, problem, "--device {d}: this machine has {d} CUDA device{s} (0 to {d})", .{ device, count, if (count == 1) "" else "s", @max(count, 1) - 1 });
+    h.ctx = cuda.Context.init(&h.driver, @intCast(device)) catch |e| return refuse(a, problem, "cannot open CUDA device {d} ({s})", .{ device, @errorName(e) });
     errdefer h.ctx.deinit();
     bound = &h.ctx;
-    h.s = cuda.Stream.init(&h.driver, true) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "cannot make a CUDA stream ({s})", .{@errorName(e)});
-        return null;
-    };
+    h.s = cuda.Stream.init(&h.driver, true) catch |e| return refuse(a, problem, "cannot make a CUDA stream ({s})", .{@errorName(e)});
     errdefer h.s.deinit();
-    h.k = family.Kernels.load(gpa, &h.driver) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "the native Hy4-flash kernel images cannot load ({s})", .{@errorName(e)});
-        return null;
-    };
+    h.k = family.Kernels.load(gpa, &h.driver) catch |e| return refuse(a, problem, "the native Hy4-flash kernel images cannot load ({s})", .{@errorName(e)});
     errdefer h.k.deinit();
-    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
-        return null;
-    };
+    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
-    // The last load-time allocations are in: KV, the indexer's keys, the recall scores and the dense scratch. A GG10's
+    // The last load-time allocations are in: KV, the indexer's keys, the recall scores and the dense scratch. A GB10's
     // device memory is the system's, so the floor is read here and not inferred from the loader's per-layer guard.
     const bytes = h.c.bytes();
     const avail = family.memAvailable();
     if (avail < floor_gib << 30) {
         const over = (floor_gib << 30) - avail;
-        const per_token = family.bytesPerToken(12);
-        const slack = if (over / per_token < capacity) capacity - @as(u32, @intCast(over / per_token)) else 0;
-        problem.* = try std.fmt.allocPrint(a, "a {d}-token context leaves {d:.2} GiB of MemAvailable, under the {d} GiB floor: serve --context {d} or less", .{ capacity, gib(avail), floor_gib, slack / 512 * 512 });
-        return null;
+        const per_token = family.bytesPerToken(h.c.m);
+        if (per_token == 0 or over / per_token >= capacity) return refuse(a, problem, "a {d}-token context leaves {d:.2} GiB of MemAvailable, {d:.2} GiB under the {d} GiB floor: even {d} tokens would not fit now", .{ capacity, gib(avail), gib(over), floor_gib, least_context });
+        const slack = @max(capacity - @as(u32, @intCast(over / per_token)), least_context);
+        return refuse(a, problem, "a {d}-token context leaves {d:.2} GiB of MemAvailable, {d:.2} GiB under the {d} GiB floor: serve --context {d} or less", .{ capacity, gib(avail), gib(over), floor_gib, slack / 512 * 512 });
     }
     h.cfg = try lanes.Config.init(gpa, family.Cuda.facts(), family.max_window, 0);
     errdefer h.cfg.deinit(gpa);
