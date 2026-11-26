@@ -100,7 +100,7 @@ pub const Cuda = struct {
     }
 
     /// The oldest position a rewind to length `r` may read: its first row's window must still hold its own rows.
-    fn mayRewind(self: *const Cuda, r: u32) bool {
+    pub fn mayRewind(self: *const Cuda, r: u32) bool {
         const first = if (r + 1 > ring_window) r + 1 - ring_window else 0;
         return first >= self.valid_from;
     }
@@ -114,7 +114,7 @@ pub const Cuda = struct {
     }
 
     /// `tokens` at the caches' end: the model's pass, then the ring's bookkeeping and the timers.
-    fn pass(self: *Cuda, tokens: []const u32) !void {
+    pub fn pass(self: *Cuda, tokens: []const u32) !void {
         const start = self.m.history.items.len;
         if (start + tokens.len > self.m.capacity) return error.Hy4ContextFull;
         // The model appends before it forwards: a failed pass leaves the history claiming rows nothing wrote.
@@ -198,31 +198,49 @@ pub const Cuda = struct {
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = cast(ptr);
         const ids = s.prompt();
-        if (ids.len == 0) return error.EmptyHy4Prompt;
         if (ids.len + s.max_new > self.m.capacity) return error.Hy4ContextFull;
+        const t0 = std.Io.Clock.awake.now(self.io);
+        const from = try self.fill(ids, s);
+        const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
+        std.log.debug("hy4-cuda: prompt {d} tokens, {d} reused, {d} prefilled in {d:.1} ms", .{ ids.len, from, ids.len - from, @as(f64, @floatFromInt(ns)) / 1e6 });
+    }
+
+    /// `fill`, and the stream's own accounting: the rows it reused, its cancellation and each pass's width.
+    pub fn fill(self: *Cuda, ids: []const u32, s: ?*lanes.Stream) !usize {
+        if (ids.len == 0) return error.EmptyHy4Prompt;
+        if (ids.len > self.m.capacity) return error.Hy4ContextFull;
+        const from = self.reuseFrom(ids);
+        if (s) |stream| stream.cached = @intCast(from);
+        var at = from;
+        while (at < ids.len) {
+            if (s) |stream| {
+                if (stream.isCancelled()) return error.Cancelled;
+            }
+            const end = @min(ids.len, at + prompt_rows);
+            try self.pass(ids[at..end]);
+            if (s) |stream| lanes.prefill_widths.completed(self.gpa, stream, end - at);
+            at = end;
+        }
+        return from;
+    }
+
+    /// The row a fill starts at: the kept caches' shared prefix, when it is long enough to be worth keeping and the ring
+    /// still holds the rows its first new row reads. The history is cut to it, and the caches are no longer kept.
+    pub fn reuseFrom(self: *Cuda, ids: []const u32) usize {
         var from: usize = 0;
-        if (self.kept) {
+        if (self.kept and ids.len > 0) {
             const hist = self.m.history.items;
             var same: usize = 0;
             const most = @min(hist.len, ids.len - 1);
             while (same < most and hist[same] == ids[same]) same += 1;
-            if (same >= keep_prefix and same <= self.m.capacity and self.mayRewind(@intCast(same))) from = same;
+            if (same >= keep_prefix and self.mayRewind(@intCast(same))) from = same;
             self.kept = false;
         }
         if (self.m.history.items.len != from) {
             self.m.history.items.len = from;
             if (from == 0) self.valid_from = 0;
         }
-        s.cached = @intCast(from);
-        var at = from;
-        while (at < ids.len) {
-            if (s.isCancelled()) return error.Cancelled;
-            const end = @min(ids.len, at + prompt_rows);
-            try self.pass(ids[at..end]);
-            lanes.prefill_widths.completed(self.gpa, s, end - at);
-            at = end;
-        }
-        std.log.debug("hy4-cuda: prompt {d} tokens, {d} reused, {d:.1} ms ({d:.1} tok/s)", .{ ids.len, from, @as(f64, @floatFromInt(self.prefill_ns)) / 1e6, @as(f64, @floatFromInt(self.prefill_rows)) * 1e9 / @as(f64, @floatFromInt(@max(self.prefill_ns, 1))) });
+        return from;
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) !u64 {
@@ -360,4 +378,49 @@ test "a rewind is allowed exactly while the ring still holds the rows its first 
     try std.testing.expect(c.mayRewind(1023)); // first row reads from 512: still its own
     try std.testing.expect(!c.mayRewind(1022)); // first row would read 511, overwritten by then
     try std.testing.expect(!c.mayRewind(0));
+}
+
+test "a rewind drops 1,025 rows and no more: a row reads back 511 of its own" {
+    var c: Cuda = undefined;
+    const h: u32 = 8_192; // a fill past four ring wraps
+    c.valid_from = h - ring_rows;
+    // The first row a rewind to `r` writes reads positions r-511..r, so r-511 must still be its own row.
+    try std.testing.expectEqual(@as(u32, h - ring_rows), h - 1025 - 511);
+    try std.testing.expect(c.mayRewind(h - 1024));
+    try std.testing.expect(c.mayRewind(h - 1025));
+    try std.testing.expect(!c.mayRewind(h - 1026));
+}
+
+test "a prompt resumes at its shared prefix only above the keep floor and inside the ring's bound" {
+    var hist: [4_096]u32 = undefined;
+    var prompt: [4_096]u32 = undefined;
+    for (&hist, 0..) |*t, i| t.* = @intCast(i % 1000 + 1);
+    @memcpy(&prompt, &hist);
+    var m: model.Model = undefined;
+    m.capacity = 262_144;
+    var c: Cuda = undefined;
+    c.m = &m;
+
+    // A 2,048-row history, the caches kept, and a prompt sharing 1,024 rows of it: the fill resumes at 1,024.
+    prompt[1024] = 5;
+    m.history = .{ .items = hist[0..2048], .capacity = hist.len, .pointer_stability = .{} };
+    c.valid_from = 2048 - ring_rows;
+    c.kept = true;
+    try std.testing.expectEqual(@as(usize, 1024), c.reuseFrom(&prompt));
+    try std.testing.expect(!c.kept); // one fill decides, and the caches are no longer kept
+    try std.testing.expectEqual(@as(usize, 1024), m.history.items.len); // the history is cut to the resume
+
+    // A 63-row prefix is below the floor: a shorter fill is not worth resuming, so the next prompt starts at row 0.
+    m.history = .{ .items = hist[0..63], .capacity = hist.len, .pointer_stability = .{} };
+    c.valid_from = 0;
+    c.kept = true;
+    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(&prompt));
+    try std.testing.expectEqual(@as(usize, 0), m.history.items.len);
+
+    // A prefix the ring no longer holds: at 300 rows of a 2,403-row fill its first new row would read an overwritten slot.
+    prompt[300] = 6;
+    m.history = .{ .items = hist[0..2403], .capacity = hist.len, .pointer_stability = .{} };
+    c.valid_from = 2403 - ring_rows;
+    c.kept = true;
+    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(&prompt));
 }

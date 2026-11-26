@@ -29,3 +29,20 @@ pub fn install(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const exe = b.addExecutable(.{ .name = "tf-hy4-cuda-generate", .root_module = root });
     b.step("hy4-cuda-generate", "Build the Hy4-flash CUDA greedy generator for EXL3 checkpoints").dependOn(&b.addInstallArtifact(exe, .{}).step);
 }
+
+/// `tf-hy4-cuda-reuse`: the server's prefix reuse against a fresh fill on a device (the caches' two fills must match).
+pub fn installReuse(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) void {
+    const root = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/hy4_flash/reuse_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    root.addImport("lanes", lanes);
+    root.addImport("cuda", cuda);
+    root.addImport("core", core);
+    root.addImport("engram_hash_core", b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/engram_hash.zig"), .target = target, .optimize = optimize }));
+    root.addImport("config_number", b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/config_number.zig") }));
+    const exe = b.addExecutable(.{ .name = "tf-hy4-cuda-reuse", .root_module = root });
+    b.step("hy4-cuda-reuse", "Build the Hy4-flash prefix-reuse check that needs a device").dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
