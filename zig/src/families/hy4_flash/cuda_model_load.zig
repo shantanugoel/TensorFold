@@ -51,7 +51,11 @@ fn up(self: *Model, ck: *core.Checkpoint, comptime fmt: []const u8, args: anytyp
 pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *Kernels, dir: []const u8, o: Options) !*Model {
     const capacity = o.capacity;
     const max_rows = o.max_rows;
-    const cfg = try config.parse(a, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 20)));
+    const config_path = try std.fs.path.join(a, &.{ dir, "config.json" });
+    defer a.free(config_path);
+    const config_bytes = try std.Io.Dir.cwd().readFileAlloc(io, config_path, a, .limited(1 << 20));
+    defer a.free(config_bytes);
+    const cfg = try config.parse(a, config_bytes);
     const t = cfg.value.text_config;
     if (t.hidden_size != H or t.hc_mult != S or t.routed_expert_hidden_size != L or t.moe_intermediate_size != L or
         t.intermediate_size != D or t.n_routed_experts != E or t.num_experts_per_tok != K or t.q_lora_rank != Q)
@@ -61,6 +65,10 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     if (o.ring) try geom.ring.check(max_rows);
     const ck = try a.create(core.Checkpoint);
     ck.* = try core.Checkpoint.openModel(a, io, dir);
+    defer {
+        ck.close();
+        a.destroy(ck);
+    }
     const self = try a.create(Model);
     self.* = .{
         .a = a,
@@ -69,6 +77,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         .s = s,
         .k = k,
         .text = t,
+        .cfg = cfg,
         // Upload tables and staging go through a freeing allocator: the arena would keep them all.
         .own = .{ .d = d, .gpa = std.heap.page_allocator, .max_buffers = 1 << 20, .slab = 256 << 20 },
         .layers = try a.alloc(Layer, t.num_hidden_layers),
@@ -94,6 +103,9 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     ck.release();
     // UMA guard: device memory is not charged to the cgroup, so stop before the system runs dry.
     const floor_gib = try @import("sys").environment.read(usize, "TF_HY4_MEM_FLOOR_GIB", 10);
+    // The Engram tables' shards come from one parse of the model index; a pack without Engram layers never reads it.
+    var shards: ?load_util.Shards = if (t.engram_layer_ids.len == 0) null else try load_util.Shards.open(a, io, dir);
+    defer if (shards) |*sh| sh.deinit();
     for (self.layers, 0..) |*layer, i| {
         const avail = load_util.memAvailable();
         std.debug.print("layer {d:>2}: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ i, load_util.gib(self.own.bytes), load_util.gib(avail) });
@@ -101,7 +113,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
             std.debug.print("stopping: MemAvailable below the {d} GiB floor\n", .{floor_gib});
             return error.Hy4MemoryFloor;
         }
-        layer.* = try loadLayer(self, a, io, ck, dir, i);
+        layer.* = try loadLayer(self, a, ck, if (shards) |*sh| sh else null, i);
         // The layer is on the device: its mapped shard pages (and page cache) would otherwise stay resident.
         ck.release();
     }
@@ -174,7 +186,7 @@ fn reserveDense(self: *Model) !void {
     std.debug.print("EXL3 dense scratch {d:.1} MiB\n", .{@as(f64, @floatFromInt(bytes)) / (1 << 20)});
 }
 
-fn loadLayer(self: *Model, a: std.mem.Allocator, io: std.Io, ck: *core.Checkpoint, dir: []const u8, i: usize) !Layer {
+fn loadLayer(self: *Model, a: std.mem.Allocator, ck: *core.Checkpoint, shards: ?*const load_util.Shards, i: usize) !Layer {
     const t = self.text;
     const sliding = t.layer_types[i] == .sliding_attention;
     const heads: u32 = if (sliding) t.swa_num_attention_heads else t.num_attention_heads;
@@ -279,7 +291,8 @@ fn loadLayer(self: *Model, a: std.mem.Allocator, io: std.Io, ck: *core.Checkpoin
         const hash = try engram.Layer.open(t, @intCast(i + 1));
         var tb: [128]u8 = undefined;
         const table_name = try std.fmt.bufPrint(&tb, e ++ "multi_head_embedding.embedding.weight", .{i});
-        const shard = try load_util.shardOf(a, io, dir, table_name);
+        var sb: [416]u8 = undefined;
+        const shard = try (shards orelse return error.MissingHy4EngramTable).shardOf(&sb, table_name) orelse return error.MissingHy4EngramTable;
         // The config's per-layer row count, so a wrong or repacked table fails here and not mid-forward.
         const rows_expected = try t.engramRows(@intCast(i + 1));
         var table = try direct.openDirect(a, shard, table_name, map, hash, rows_expected);

@@ -23,10 +23,33 @@ pub fn memAvailable() usize {
     return 0;
 }
 
-/// The safetensors file holding `name`, through the model index (an Engram table sits alone in its shard).
-pub fn shardOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![:0]const u8 {
-    const index = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "model.safetensors.index.json" }), a, .limited(1 << 26));
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, index, .{});
-    const file = parsed.object.get("weight_map").?.object.get(name) orelse return error.MissingHy4EngramTable;
-    return std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, file.string }, 0);
-}
+/// `model.safetensors.index.json`, read and parsed once a load: each Engram layer asks it for its table's shard.
+pub const Shards = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    dir: []const u8,
+
+    pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Shards {
+        const path = try std.fs.path.join(a, &.{ dir, "model.safetensors.index.json" });
+        defer a.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 26));
+        defer a.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        errdefer parsed.deinit();
+        if (parsed.value != .object) return error.MissingHy4EngramTable;
+        if (parsed.value.object.get("weight_map")) |map| if (map != .object) return error.MissingHy4EngramTable;
+        if (parsed.value.object.get("weight_map") == null) return error.MissingHy4EngramTable;
+        return .{ .parsed = parsed, .dir = dir };
+    }
+
+    pub fn deinit(self: *Shards) void {
+        self.parsed.deinit();
+    }
+
+    /// The safetensors file holding `name`, as `<dir>/<file>` in `buf`; null when the map does not name it.
+    pub fn shardOf(self: *const Shards, buf: []u8, name: []const u8) !?[:0]const u8 {
+        const map = self.parsed.value.object.get("weight_map").?.object;
+        const file = map.get(name) orelse return null;
+        if (file != .string) return error.MissingHy4EngramTable;
+        return try std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ self.dir, file.string }, 0);
+    }
+};

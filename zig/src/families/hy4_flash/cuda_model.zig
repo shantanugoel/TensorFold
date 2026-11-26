@@ -138,6 +138,8 @@ pub const Model = struct {
     s: cuda.Stream,
     k: *Kernels,
     text: config.Text,
+    /// `config.json`'s own parse: `text`'s slices point into its arena, so it lives as long as the model does.
+    cfg: std.json.Parsed(config.Model),
     own: cuda.exl3_upload.Uploader,
     layers: []Layer,
     embed: u64,
@@ -393,6 +395,7 @@ pub const Model = struct {
         for (&owned) |*b| b.free();
         self.own.deinit();
         self.history.deinit(self.a);
+        self.cfg.deinit();
         const a = self.a;
         a.free(self.engrams);
         a.free(self.layers);
