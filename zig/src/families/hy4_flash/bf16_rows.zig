@@ -161,30 +161,61 @@ pub fn execute(a: std.mem.Allocator, g: Geometry, plan: Plan, output: []u16) Err
 }
 
 fn readRows(g: Geometry, plan: Plan, output: []u16, arena: []align(alignment) u8) Error!void {
-    for (plan.ext) |e| {
+    try readRange(g, plan, arena, 0, plan.ext.len);
+    copyRows(plan, arena, output);
+}
+
+/// One reader's share: the plan's extents `first..last` into the shared arena.
+fn readRange(g: Geometry, plan: Plan, arena: []align(alignment) u8, first: usize, last: usize) Error!void {
+    for (plan.ext[first..last]) |e| {
         const buf: []align(alignment) u8 = @alignCast(arena[e.at..][0..e.len]);
         try readExtent(g, buf, e.off, e.len);
     }
-    // Little-endian host: copying bytes preserves each BF16 bit pattern.
-    for (plan.at, 0..) |src, i| {
-        @memcpy(std.mem.asBytes(output[i * width ..][0..width]), arena[src..][0..row_bytes]);
-    }
 }
 
-/// In-flight direct read; keep the plan, file, and destination alive through deinit.
+/// The plan's rows into `output` from the arena, in token/head order; little-endian, so a copy keeps each bit pattern.
+fn copyRows(plan: Plan, arena: []const u8, output: []u16) void {
+    for (plan.at, 0..) |src, i| @memcpy(std.mem.asBytes(output[i * width ..][0..width]), arena[src..][0..row_bytes]);
+}
+
+/// Readers one plan is cut into: enough in flight at once to keep a random-read queue busy.
+pub const readers = 8;
+
+/// In-flight direct reads over one plan; keep the plan, the geometry and the destination alive until `finish`.
 pub const Prefetch = struct {
     arena: []align(alignment) u8,
-    future: std.Io.Future(Error!void),
+    plan: *const Plan,
+    output: []u16,
+    futures: [readers]std.Io.Future(Error!void) = @splat(undefined),
+    started: usize = 0,
 
-    pub fn start(a: std.mem.Allocator, io: std.Io, g: Geometry, plan: Plan, output: []u16) !Prefetch {
+    /// Start `workers` readers over the plan's extents, each a share of its merged reads.
+    pub fn start(a: std.mem.Allocator, io: std.Io, g: Geometry, plan: *const Plan, output: []u16, workers: usize) !Prefetch {
         if (output.len != plan.rows.len * width) return error.BadOutput;
         const arena = try a.alignedAlloc(u8, .fromByteUnits(alignment), plan.arena_len);
-        errdefer a.free(arena);
-        return .{ .arena = arena, .future = try io.concurrent(readRows, .{ g, plan, output, arena }) };
+        var self: Prefetch = .{ .arena = arena, .plan = plan, .output = output };
+        errdefer self.deinit(a, io); // a reader already started outlives this frame: wait for it first
+        const n = @min(@max(workers, 1), readers, plan.ext.len);
+        var first: usize = 0;
+        for (0..n) |i| {
+            const last = plan.ext.len * (i + 1) / n;
+            self.futures[i] = try io.concurrent(readRange, .{ g, plan.*, arena, first, last });
+            self.started = i + 1;
+            first = last;
+        }
+        return self;
     }
 
+    /// Waits for every reader, then hands the plan's rows to `output`: what a layer calls when it needs them.
     pub fn finish(self: *Prefetch, io: std.Io) Error!void {
-        try self.future.await(io);
+        const n = self.started;
+        self.started = 0;
+        var failure: ?Error = null;
+        for (self.futures[0..n]) |*f| f.await(io) catch |e| {
+            if (failure == null) failure = e;
+        };
+        if (failure) |e| return e;
+        copyRows(self.plan.*, self.arena, self.output);
     }
 
     pub fn deinit(self: *Prefetch, a: std.mem.Allocator, io: std.Io) void {

@@ -16,6 +16,7 @@ const load_util = @import("cuda_load_util.zig");
 const engram = @import("engram.zig");
 const engram_cuda = @import("engram_cuda.zig");
 const direct = @import("bf16_rows.zig");
+const engram_pass = @import("engram_pass.zig");
 const geom = @import("cuda_scratch.zig");
 const cuda_index = @import("cuda_index.zig");
 
@@ -29,6 +30,8 @@ const Q = geom.Q;
 const sparse_stride = geom.sparse_stride;
 const sliding_stride = geom.sliding_stride;
 const Scratch = geom.Scratch;
+/// Reads one Engram table is cut into: four tables started together is 32 of them in flight a pass.
+const engram_readers = 8;
 
 pub const Kernels = struct {
     gemm: cuda.vit.Gemms,
@@ -134,7 +137,9 @@ pub const Model = struct {
     history: std.ArrayList(u32) = .empty,
     expert_scratch: exl3.Shared = .{},
     weight_bytes: usize = 0,
-    /// Host nanoseconds a pass spent on the Engram rows: planning, reading and copying.
+    /// The Engram tables in layer order, so a pass starts every table's rows at once.
+    engrams: []*const direct.Table = &.{},
+    /// Host nanoseconds a pass spent on the Engram rows: planning, reading and waiting.
     engram_ns: i96 = 0,
 
     fn tensor(ck: *core.Checkpoint, name: []const u8, dtype: anytype, shape: []const usize) ![]const u8 {
@@ -216,6 +221,16 @@ pub const Model = struct {
             // The layer is on the device: its mapped shard pages (and page cache) would otherwise stay resident.
             ck.release();
         }
+        // The Engram tables in layer order: a pass reads them all at once, so the order has to be the layers'.
+        var engram_count: usize = 0;
+        for (self.layers) |l| engram_count += @intFromBool(l.engram != null);
+        const engrams = try a.alloc(*const direct.Table, engram_count);
+        var seen: usize = 0;
+        for (self.layers) |*l| if (l.engram) |*e| {
+            engrams[seen] = &e.table;
+            seen += 1;
+        };
+        self.engrams = engrams;
         // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor
         try @import("loader.zig").finishCuda(ck, cfg.value);
         std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
@@ -458,7 +473,8 @@ pub const Model = struct {
             counts_sliding[r] = @intCast(pos + 1 - first);
             for (first..pos + 1, 0..) |j, n| keys_sliding[r * sliding_stride + n] = @intCast(if (self.ring) geom.ring.slot(j) else j);
         }
-        // Engram windows from the committed history.
+        // Engram windows from the committed history, and every table's rows read while the pass runs: a row's
+        // hash depends only on the token ids, so all four tables are planned and started here, not a layer at a time.
         const windows = try self.a.alloc([engram.order]u32, rows);
         defer self.a.free(windows);
         const pad = self.text.engram_pad_id;
@@ -466,8 +482,10 @@ pub const Model = struct {
             const pos = start + r;
             for (w, 0..) |*v, back| v.* = if (pos >= back) self.history.items[pos - back] else pad;
         }
-        const raw_rows = try self.a.alloc(u16, rows * engram_cuda.input);
-        defer self.a.free(raw_rows);
+        const et0 = std.Io.Clock.awake.now(self.io);
+        var gathers = try engram_pass.Rows.start(self.a, self.io, self.engrams, windows, engram_cuda.input, engram_readers);
+        defer gathers.close(self.io);
+        self.engram_ns += et0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
 
         const rope_sparse = try self.text.rotary(.deepseek_sparse_attention);
         var slot: usize = 0; // index of the stream buffer x lives in
@@ -475,9 +493,9 @@ pub const Model = struct {
             // Engram residual into the streams.
             if (layer.engram) |*e| {
                 const et = std.Io.Clock.awake.now(self.io);
-                try e.table.gather(self.a, windows, raw_rows);
+                const raw = try gathers.next(self.io);
                 self.engram_ns += et.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
-                try sc.e_raw.uploadAsync(0, std.mem.sliceAsBytes(raw_rows), s.handle);
+                try sc.e_raw.uploadAsync(0, std.mem.sliceAsBytes(raw), s.handle);
                 const out = sc.streams[(slot + 1) % 3].ptr;
                 try k.engram.forward(s, &k.gemm, e.w, .{
                     .raw = sc.e_raw.ptr,
