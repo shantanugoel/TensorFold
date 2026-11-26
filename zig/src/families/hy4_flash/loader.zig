@@ -93,13 +93,15 @@ const CudaOwnership = struct {
 };
 
 /// Finish the CUDA target's checkpoint after its layers have been read.
-pub fn finishCuda(ck: *core.Checkpoint, model: config.Model) !void {
+/// The checkpoint's last read: everything an engine did not take is a stray, except the two branches no CUDA
+/// consumer reads yet. `drafter`: the model holds DFly2's tensors, so they are this load's and a stray among
+/// them is refused as any other; without it the whole prefix is skipped, as the vision tower's is (plan 7.9).
+pub fn finishCuda(ck: *core.Checkpoint, model: config.Model, drafter: bool) !void {
     var ownership: CudaOwnership = .{ .checkpoint = ck };
     // Only the names matter here; four bits keeps the shared enumerator's logical dimensions valid.
     try weights.checkCudaAuxiliary(&ownership, model, 4);
-    // The vision tower and the DFly2 drafter wait for their own CUDA consumers (plan 7.8/7.9): skipped on purpose.
     try ck.skip("vit.");
-    try ck.skip("model.dfly_layers.");
+    if (!drafter) try ck.skip("model.dfly_layers.");
     try refuseLeftovers(ck, error.UnusedHy4Tensors);
 }
 

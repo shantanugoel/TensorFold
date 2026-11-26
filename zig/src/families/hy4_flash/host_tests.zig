@@ -14,6 +14,7 @@ test {
     _ = @import("rank_weights.zig");
     _ = @import("cuda_model.zig");
     _ = @import("serve_cuda.zig");
+    _ = @import("cuda_draft.zig");
     _ = @import("index_recall.zig");
     _ = @import("forward.zig");
     _ = @import("exl3_weights.zig");
@@ -128,11 +129,15 @@ test "the CUDA loader owns the auxiliary tensors it leaves out and refuses a str
     model.dfly_num_hidden_layers = 1;
     model.dfly_target_index_layer = &.{0};
     model.dfly_target_kv_layers = &.{0};
-    // The vision tower and the drafter are skipped by prefix on CUDA until their consumers land; all else refuses.
-    const strays = [_]struct { name: []const u8, refused: bool }{
-        .{ .name = "model.stray.weight", .refused = true },
-        .{ .name = "vit.stray.weight", .refused = false },
-        .{ .name = "model.dfly_layers.stray.weight", .refused = false },
+    // The vision tower is skipped by prefix until its CUDA consumer lands (plan 7.9), and the drafter's prefix is
+    // skipped only when no drafter is loaded: a load that holds DFly2 owns `model.dfly_layers.*` and refuses a stray.
+    const strays = [_]struct { name: []const u8, drafter: bool, refused: bool }{
+        .{ .name = "model.stray.weight", .drafter = false, .refused = true },
+        .{ .name = "model.stray.weight", .drafter = true, .refused = true },
+        .{ .name = "vit.stray.weight", .drafter = false, .refused = false },
+        .{ .name = "vit.stray.weight", .drafter = true, .refused = false },
+        .{ .name = "model.dfly_layers.stray.weight", .drafter = false, .refused = false },
+        .{ .name = "model.dfly_layers.stray.weight", .drafter = true, .refused = true },
     };
     for (strays) |stray| {
         var tmp = std.testing.tmpDir(.{});
@@ -148,10 +153,8 @@ test "the CUDA loader owns the auxiliary tensors it leaves out and refuses a str
         defer ck.close();
         _ = try ck.expect("model.norm.weight", .bf16, &.{1});
         if (stray.refused) {
-            try std.testing.expectError(error.UnusedHy4Tensors, loader.finishCuda(&ck, model));
-        } else {
-            try loader.finishCuda(&ck, model);
-        }
+            try std.testing.expectError(error.UnusedHy4Tensors, loader.finishCuda(&ck, model, stray.drafter));
+        } else try loader.finishCuda(&ck, model, stray.drafter);
     }
 }
 
