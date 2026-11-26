@@ -53,9 +53,8 @@ pub const Layer = struct {
 
 /// The indexer's share of a pass: the fixed-row projections, one layer's scores and recall rows.
 pub const Scratch = struct {
-    rows: usize, // the GEMM row count every pass uses, so a row's keys never depend on the pass size
-    shape: recall.Shape,
-    hidden: cuda.DeviceBuffer, // [rows][hidden] BF16, zero past the pass's own rows
+    gemm_rows: usize, // the GEMM row count every pass uses, so a row's keys never depend on the pass size
+    shape: recall.Shape, // scores and lists are sized for `gemm_rows`; a pass's own rows come from `shapeFor`
     projected: u64,
     norm_tmp: u64,
     staged: u64,
@@ -70,9 +69,8 @@ pub const Scratch = struct {
         const score_groups: u32 = @intCast(groups_of(capacity));
         const group_rows = max_rows / groups.slots + 2;
         return .{
-            .rows = max_rows,
-            .shape = .{ .rows = @intCast(max_rows), .score_groups = score_groups, .group_budget = index.budget_groups },
-            .hidden = try cuda.DeviceBuffer.alloc(d, max_rows * geom.H * 2),
+            .gemm_rows = max_rows,
+            .shape = .{ .rows = 0, .score_groups = score_groups, .group_budget = index.budget_groups },
             .projected = try zeros(d, max_rows * index.width * 2),
             .norm_tmp = try zeros(d, max_rows * index.width * 2),
             .staged = try zeros(d, max_rows * index.width * 2),
@@ -89,6 +87,13 @@ pub const Scratch = struct {
     pub fn scoreBytes(self: Scratch) usize {
         return self.scores.len;
     }
+
+    /// The pass's own shape: the rotary, score and select kernels walk the rows a pass has, not the GEMM width.
+    pub fn shapeFor(self: Scratch, rows: usize) recall.Shape {
+        var shape = self.shape;
+        shape.rows = @intCast(rows);
+        return shape;
+    }
 };
 
 /// One indexed layer's indexer work for one pass: keys, the groups it closes, and its recall lists.
@@ -100,7 +105,7 @@ pub const Call = struct {
     project: mla.Projections,
     scratch: *Scratch,
     layer: *const Layer,
-    hidden: u64, // the layer's input-norm rows [rows][hidden_size]
+    hidden: u64, // the layer's input-norm rows [rows][hidden_size], at least `gemm_rows` of them
     q_resid: u64, // q_a_layernorm's rows [rows][q_lora_rank]
     write_slots: u64,
     positions: u64,
@@ -120,13 +125,13 @@ pub fn forward(c: Call) !void {
     const sc = c.scratch;
     const s = c.s;
     const rows = c.rows;
-    if (rows == 0 or rows > sc.rows) return error.BadHy4IndexRows;
-    if (c.first + rows > @as(usize, sc.shape.score_groups) * groups.slots) return error.Hy4IndexPastCapacity;
+    const shape = sc.shapeFor(rows);
+    if (rows == 0 or rows > sc.gemm_rows) return error.BadHy4IndexRows;
+    if (c.first + rows > @as(usize, shape.score_groups) * groups.slots) return error.Hy4IndexPastCapacity;
     // Token keys at fixed row widths, so a token's key never depends on how many rows share its pass.
-    try sc.hidden.copyFrom(0, c.hidden, rows * c.hidden_size * 2, s.handle);
     try c.indexer.cacheKeys(s, c.gemms, c.norms, c.layer.w, .{
-        .hidden = sc.hidden.ptr,
-        .gemm_rows = sc.rows,
+        .hidden = c.hidden,
+        .gemm_rows = sc.gemm_rows,
         .count = rows,
         .projected = sc.projected,
         .norm_tmp = sc.norm_tmp,
@@ -147,8 +152,8 @@ pub fn forward(c: Call) !void {
     try sc.recall_rows.uploadAsync(0, std.mem.sliceAsBytes(rows_out[0..rows]), s.handle);
     try c.indexer.select(s, c.gemms, c.project, c.layer.w, .{
         .q_resid = c.q_resid,
-        .hidden = sc.hidden.ptr,
-        .gemm_rows = sc.rows,
+        .hidden = c.hidden,
+        .gemm_rows = sc.gemm_rows,
         .positions = c.positions,
         .table = c.table,
         .query = sc.query,
@@ -158,7 +163,7 @@ pub fn forward(c: Call) !void {
         .scores = sc.scores.ptr,
         .tokens = c.slots,
         .counts = c.counts,
-    }, sc.shape, c.q_rank, c.hidden_size, c.rope);
+    }, shape, c.q_rank, c.hidden_size, c.rope);
 }
 
 /// Groups a cache of `capacity` slots closes: the last token's group included.
