@@ -1,5 +1,6 @@
 //! Hy4-flash text model on CUDA for EXL3 routed experts with BF16 elsewhere; one sequence, causal or windowed keys.
 const std = @import("std");
+const core = @import("core");
 const cuda = @import("cuda");
 const config = @import("config.zig");
 const ihc = @import("ihc.zig");
@@ -140,6 +141,8 @@ pub const Model = struct {
     text: config.Text,
     /// `config.json`'s own parse: `text`'s slices point into its arena, so it lives as long as the model does.
     cfg: std.json.Parsed(config.Model),
+    /// The checkpoint's mappings: the Engram token map reads its vocabulary out of one, so they outlive the load.
+    ck: *core.Checkpoint,
     own: cuda.exl3_upload.Uploader,
     layers: []Layer,
     embed: u64,
@@ -396,6 +399,8 @@ pub const Model = struct {
         self.own.deinit();
         self.history.deinit(self.a);
         self.cfg.deinit();
+        self.ck.close();
+        self.a.destroy(self.ck);
         const a = self.a;
         a.free(self.engrams);
         a.free(self.layers);

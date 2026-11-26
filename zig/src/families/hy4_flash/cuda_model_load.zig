@@ -65,7 +65,8 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     if (o.ring) try geom.ring.check(max_rows);
     const ck = try a.create(core.Checkpoint);
     ck.* = try core.Checkpoint.openModel(a, io, dir);
-    defer {
+    // The Engram token map reads its vocabulary out of these mappings, so the model owns them and frees them last.
+    errdefer {
         ck.close();
         a.destroy(ck);
     }
@@ -78,6 +79,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         .k = k,
         .text = t,
         .cfg = cfg,
+        .ck = ck,
         // Upload tables and staging go through a freeing allocator: the arena would keep them all.
         .own = .{ .d = d, .gpa = std.heap.page_allocator, .max_buffers = 1 << 20, .slab = 256 << 20 },
         .layers = try a.alloc(Layer, t.num_hidden_layers),
