@@ -165,6 +165,18 @@ pub const Model = struct {
     engram_ns: i96 = 0,
     /// The pack's DFly2 drafter, when a round holds drafts: `cuda_draft.zig`, and null on the one-row path.
     draft: ?dfly.Draft = null,
+    /// A row's four streams after every layer, for the row-count check: the trunk's own answer to "does this row
+    /// depend on how many rows went through with it". Null unless a debug tool asks; nothing in the server sets it.
+    trace: ?Trace = null,
+
+    pub const Trace = struct {
+        row: usize,
+        buf: cuda.DeviceBuffer,
+        /// The row's router picks and logits after every layer's routing: a near tie that flips with the pass's
+        /// shape is a different expert set, which is the one discrete way a row can move.
+        picks: cuda.DeviceBuffer,
+        scores: cuda.DeviceBuffer,
+    };
 
     /// What one load takes: the context's rows, the widest pass, whether sliding layers keep a ring, and the
     /// drafts a round holds (0: no DFly2 drafter, which is the only shape a one-row window has).
@@ -366,6 +378,10 @@ pub const Model = struct {
                     try k.gemm.run(s, sc.hidden, sp.latent_in, sc.latent, rows, L, H, .bf16);
                     try k.router.logits(s, sc.hidden, H, sp.router, sc.logits, rows, H, E);
                     try k.glue.topk(s, sc.logits, sp.router_bias, .{ .experts = E, .topk = K, .shared = false, .score = true, .normalize = true, .scale = self.text.routed_scaling_factor }, sc.picks, sc.probabilities, rows);
+                    if (self.trace) |t| if (t.row < rows) {
+                        try t.picks.copyFrom(layer_index * K * 4, sc.picks + t.row * K * 4, K * 4, s.handle);
+                        try t.scores.copyFrom(layer_index * E * 4, sc.logits + t.row * E * 4, E * 4, s.handle);
+                    };
                     const y = try sp.routed.run(&k.experts, s, sc.latent, sc.picks, rows);
                     try k.glue.combine(s, y, .f32, sc.probabilities, sc.mix, .bf16, rows, K, L);
                     try k.gemm.run(s, sc.mix, sp.latent_out, sc.route_out, rows, H, L, .bf16);
@@ -378,6 +394,9 @@ pub const Model = struct {
             }
             const after_ff = sc.streams[(slot + 1) % 3].ptr;
             try k.ihc.add(s, .{ .residual = x, .branch = sc.branch_norm, .post = sc.post, .output = after_ff }, self.hcShape(rows, 2 * S));
+            if (self.trace) |t| if (t.row < rows) {
+                try t.buf.copyFrom(layer_index * S * H * 2, after_ff + t.row * S * H * 2, S * H * 2, s.handle);
+            };
             slot = (slot + 1) % 3;
             x = after_ff;
         }
@@ -397,7 +416,7 @@ pub const Model = struct {
                 held = true;
             }
         }
-        if (!held) try self.headRows(s, x, rows - 1, 1, logits_out, geom.head_block);
+        if (!held) try self.headRows(s, x, rows - 1, 1, logits_out, @min(geom.head_block, rows));
     }
 
     /// Whether `part` lies wholly inside `whole`: a verify window's rows are one buffer, and writing the last row

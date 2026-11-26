@@ -69,6 +69,8 @@ pub const Cuda = struct {
     draft_proposed: u64 = 0,
     draft_kept: u64 = 0,
     draft_ns: i96 = 0,
+    /// `TF_HY4_ROUND_LOG`: every round's window, its rows' draws and what it kept, on stderr.
+    log_rounds: bool = false,
 
     /// Loads the pack and its caches: `capacity` slots a sequence, the widest pass `prompt_rows` rows, and
     /// `drafts` DFly2 drafts a round (0: the plain one-row path, which loads no drafter at all).
@@ -88,6 +90,7 @@ pub const Cuda = struct {
             .logits = window[0..vocab],
             .window = window,
             .words = try a.alloc(u16, vocab),
+            .log_rounds = @import("sys").environment.read(bool, "TF_HY4_ROUND_LOG", false) catch false,
         };
         return self;
     }
@@ -202,7 +205,56 @@ pub const Cuda = struct {
     }
 
     pub fn backend(self: *Cuda) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .first_row = firstRowFn, .release = releaseFn } };
+        // `keep_full_lone`: a window the target accepts whole is still a round's keep. The rewind is the identity
+        // there, but the round's accepted count and the drafter's held state are read off `keep`, so ask for it.
+        return .{ .ptr = self, .keep_full_lone = true, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .first_row = firstRowFn, .release = releaseFn } };
+    }
+
+    /// The window widths and a draft slot, timed once at load: ms a pass by rows (1..`max_window`) and ms a
+    /// draft slot. The lane core's depth rule prices a round from these; without them it drafts one whenever its
+    /// first draft's rate is under 0.8, whatever the block would have accepted. `serve_metal.zig`'s `warm` times the
+    /// same widths. The caches end up as they started: empty, with the ring readable from row 0.
+    pub const Timed = struct { rows: [max_window]f64 = @splat(0), slot_ms: f64 = 0 };
+
+    pub fn timeWindows(self: *Cuda) !Timed {
+        const dr = if (self.m.draft) |*x| x else return .{};
+        var timed: Timed = .{};
+        var ids: [dfly.width + 2]u32 = @splat(0);
+        for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
+        try self.pass(&ids);
+        const at = self.m.history.items.len;
+        for (1..max_window + 1) |width| {
+            var times: [3]f64 = undefined;
+            for (&times) |*tm| {
+                self.m.history.items.len = at;
+                const t0 = std.Io.Clock.awake.now(self.io);
+                try self.m.passRows(ids[0..width], self.logits, .{ .at = 0, .out = self.window[0 .. width * self.vocab], .head = width });
+                tm.* = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds())) / 1e6;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            timed.rows[width - 1] = times[1];
+        }
+        // A draft slot's cost over a block of three: the first call also warms the tower's own path.
+        var held: [dfly.drafts]u32 = @splat(0);
+        self.m.history.items.len = at;
+        for (0..2) |which| {
+            const t0 = std.Io.Clock.awake.now(self.io);
+            try dfly.propose(self.m, dr, at, ids[at - 1], 3, dfly.source(dr, null), held[0..3]);
+            if (which == 1) timed.slot_ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds())) / 1e6 / 3;
+        }
+        std.log.info("hy4-cuda: window ms by rows {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2}, draft {d:.2} ms a slot", .{
+            timed.rows[0], timed.rows[1], timed.rows[2], timed.rows[3], timed.rows[4], timed.rows[5], timed.slot_ms,
+        });
+        // The warm rows go: the first stream fills from row 0 as on a cold load.
+        self.m.history.items.len = 0;
+        self.valid_from = 0;
+        self.nheld = 0;
+        self.kept = false;
+        self.decode_rows = 0;
+        self.decode_ns = 0;
+        self.prefill_rows = 0;
+        self.prefill_ns = 0;
+        return timed;
     }
 
     fn cast(ptr: *anyopaque) *Cuda {
@@ -316,6 +368,7 @@ pub const Cuda = struct {
             if (w.held > 0) {
                 self.draft_rounds += 1;
                 self.draft_proposed += w.held;
+                if (self.log_rounds) std.log.info("hy4-cuda: round {d} at row {d}: window {any}", .{ self.draft_rounds, base, ids[0..rows] });
             }
             if (self.m.draft != null) try self.verifyPass(ids[0..rows]) else try self.pass(ids[0..rows]);
             for (0..rows) |r| {
@@ -323,6 +376,7 @@ pub const Cuda = struct {
                 const mask = if (w.masks.len >= (r + 1) * words) w.masks[r * words ..][0..words] else &.{};
                 o.sampled[r] = try self.draw(w.stream, w.positions[r], mask);
                 if (o.rows.len == rows) o.rows[r] = self.row(o.sampled[r], w.stream.logprobs orelse 0);
+                if (self.log_rounds) std.log.info("hy4-cuda: round {d} row {d} (position {d}): drew {d} on {d:.4}", .{ self.draft_rounds, r, w.positions[r], o.sampled[r], self.logits[o.sampled[r]] });
             }
         }
         self.logits = self.window[0..self.vocab];
@@ -356,6 +410,7 @@ pub const Cuda = struct {
             if (base < rows) return error.InvalidHy4Position;
             self.m.history.items.len = base - rows + path.len;
             if (path.len > 1) self.draft_kept += path.len - 1;
+            if (self.log_rounds) std.log.info("hy4-cuda: round {d} kept {d} of {d} rows (drafts {d} of {d}), history {d} -> {d}", .{ self.draft_rounds, path.len, rows, path.len - 1, rows - 1, base, self.m.history.items.len });
             self.nheld = 0;
         }
     }
