@@ -274,6 +274,65 @@ pub const Layer = struct {
     down_bias: u64,
 };
 
+/// The scratch's byte sizes at `patches_max` patches: the widest write each buffer takes, so a host test can check
+/// the tower's GEMMs against them without a device. The MLP's up GEMM writes `inner` a row and the merge GEMM
+/// `merge_width` (4,608) a row, both at `block_rows`; the fallback's f32 accumulator takes the unblocked GEMMs' widest
+/// output, the qkv linear's `3 * hidden` a patch row.
+pub const Sizes = struct {
+    patches: usize,
+    pos: usize,
+    attention: usize,
+    h: usize,
+    qkv: usize,
+    tmp: usize,
+    ff: usize,
+    acc: usize,
+    merged: usize,
+    proj: usize,
+};
+
+pub fn sizes(patches_max: usize) Sizes {
+    const p = patches_max;
+    const b: usize = @min(block_rows, patches_max);
+    const merges = p / (merge * merge);
+    return .{
+        .patches = p * patch_width * 2,
+        .pos = p * hidden * 2,
+        .attention = p * hidden * 2,
+        .h = p * hidden * 2,
+        .qkv = p * 3 * hidden * 2,
+        .tmp = p * hidden * 2,
+        .ff = b * @max(inner, merge_width) * 2,
+        .acc = @max(p * 3 * hidden, b * merge_width) * 4,
+        .merged = merges * merge_width * 2,
+        .proj = merges * H * 2,
+    };
+}
+
+test "every tower GEMM's output fits its scratch at the patch budget" {
+    // The widest budget the tower loads at: 4,224 LM tokens, four patches a token.
+    const p = 4 * @as(usize, token_limit);
+    const b: usize = @min(block_rows, p);
+    const sz = sizes(p);
+    // (buffer, rows, width, bytes a row element) for every GEMM the tower runs at `p`.
+    const wants = [_]struct { bytes: usize, rows: usize, width: usize, elem: usize }{
+        .{ .bytes = sz.h, .rows = p, .width = hidden, .elem = 2 }, // the patch embedding
+        .{ .bytes = sz.qkv, .rows = p, .width = 3 * hidden, .elem = 2 }, // q, k and v side by side
+        .{ .bytes = sz.tmp, .rows = p, .width = hidden, .elem = 2 }, // the attention's out projection
+        .{ .bytes = sz.ff, .rows = b, .width = inner, .elem = 2 }, // the MLP's up projection
+        .{ .bytes = sz.ff, .rows = b, .width = merge_width, .elem = 2 }, // the merge GEMM, 4,608 wide
+        .{ .bytes = sz.merged, .rows = p / (merge * merge), .width = merge_width, .elem = 2 }, // the unshuffle flatten
+        .{ .bytes = sz.proj, .rows = p / (merge * merge), .width = H, .elem = 2 }, // the projector's out
+    };
+    for (wants) |w| try std.testing.expect(w.rows * w.width * w.elem <= w.bytes);
+    // The f32 accumulator the GEMM fallback writes each output through: the qkv linear at a patch row, the merge GEMM
+    // at a block row.
+    try std.testing.expect(p * 3 * hidden * 4 <= sz.acc);
+    try std.testing.expect(b * merge_width * 4 <= sz.acc);
+    // And the block is inside the patch budget, so `b` bounds a blocked GEMM and never `p`.
+    try std.testing.expect(b <= p and b <= block_rows);
+}
+
 /// The tower's per-image scratch: one image's rows at a time, and the token-wise GEMMs' block.
 pub const Scratch = struct {
     patches: cuda.DeviceBuffer, // the raw patch rows, BF16
@@ -543,22 +602,18 @@ fn take(own: *cuda.exl3_upload.Uploader, ck: *core.Checkpoint, prefix: []const u
 
 /// The tower's per-image scratch: one image's rows at a time, and the token-wise GEMMs' block.
 fn allocScratch(d: *const cuda.Driver, own: *cuda.exl3_upload.Uploader, patches_max: usize) !Scratch {
-    const p = patches_max;
-    const b: usize = @min(block_rows, patches_max);
-    const merges = p / (merge * merge);
+    const sz = sizes(patches_max);
     var sc: Scratch = undefined;
-    sc.patches = try cuda.DeviceBuffer.alloc(d, p * patch_width * 2);
-    sc.pos = try cuda.DeviceBuffer.alloc(d, p * hidden * 2);
-    sc.attention = try cuda.DeviceBuffer.alloc(d, p * hidden * 2);
-    sc.h = try zeros(own, p * hidden * 2);
-    sc.qkv = try zeros(own, p * 3 * hidden * 2);
-    sc.tmp = try zeros(own, p * hidden * 2);
-    sc.ff = try zeros(own, b * inner * 2);
-    // The fallback's f32 accumulator: the unblocked GEMMs run a patch row (a hidden-wide output), the blocked ones a
-    // 4608-wide merge row.
-    sc.acc = try zeros(own, @max(p * hidden, b * merge_width) * 4);
-    sc.merged = try zeros(own, merges * merge_width * 2);
-    sc.proj = try zeros(own, merges * H * 2);
+    sc.patches = try cuda.DeviceBuffer.alloc(d, sz.patches);
+    sc.pos = try cuda.DeviceBuffer.alloc(d, sz.pos);
+    sc.attention = try cuda.DeviceBuffer.alloc(d, sz.attention);
+    sc.h = try zeros(own, sz.h);
+    sc.qkv = try zeros(own, sz.qkv);
+    sc.tmp = try zeros(own, sz.tmp);
+    sc.ff = try zeros(own, sz.ff);
+    sc.acc = try zeros(own, sz.acc);
+    sc.merged = try zeros(own, sz.merged);
+    sc.proj = try zeros(own, sz.proj);
     sc.newline = 0; // filled by `Tower.load` once `image_newline` is up
     return sc;
 }
