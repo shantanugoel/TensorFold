@@ -16,18 +16,18 @@ const geom = @import("cuda_scratch.zig");
 /// The text model's hidden width, which the projector outputs (`vision_config.out_hidden_size`).
 pub const H: usize = geom.H;
 /// The tower's widths, as the checkpoint's `vision_config` fixes them.
-pub const hidden = 1152;
-pub const heads = 16;
-pub const dim = 72;
-pub const inner = 4304;
+pub const hidden: usize = 1152;
+pub const heads: usize = 16;
+pub const dim: usize = 72;
+pub const inner: usize = 4304;
 /// Patches a merged token takes: 2 x 2.
-pub const merge = 2;
+pub const merge: usize = 2;
 /// One raster patch's width: C x 16 x 16.
 pub const patch_width = 3 * vc.patch * vc.patch;
 /// The projector's pixel-unshuffle width: four patches side by side.
 pub const merge_width = hidden * merge * merge;
 /// Rows the token-wise GEMMs run at once, so their block is bounded by this and not by the patch count.
-const block_rows = 2048;
+const block_rows: usize = 2048;
 /// The processor's limits: LM tokens an image may take (the patch budget's ceiling, `(gh / 2) * (gw / 2 + 1)`), and
 /// the images a request may hold.
 const limits: vc.Limits = .{};
@@ -230,6 +230,7 @@ pub const Scratch = struct {
     acc: u64, // f32 rows: the GEMM fallback's accumulator
     merged: u64, // the unshuffled 4608-wide rows
     proj: u64, // the projector's H-wide rows
+    newline: u64, // one row: `image_newline`, copied into place at the end of every merged row
 };
 
 /// The tower's weights, its per-image scratch and the host position table, read once at load.
@@ -252,6 +253,8 @@ pub const Tower = struct {
     scratch: Scratch,
     /// Patches one image may take: four a merged token, the bound the scratch is sized for.
     patches_max: usize,
+    /// A debugging run's stage dumps (the boundary check narrows a mismatch to one stage): null in a server.
+    stages: ?Stages = null,
     /// Device bytes the tower's weights take, read at load so a size report counts it.
     bytes: usize,
 
@@ -279,24 +282,26 @@ pub const Tower = struct {
             .norms = norms,
             .cfg = cfg,
             .layers = layers,
-            .patch = try take(own, ck, "vit.embeddings.patch_embedding.weight", .bf16, &.{ hidden, 3, vc.patch, vc.patch }),
-            .patch_bias = try take(own, ck, "vit.embeddings.patch_embedding.bias", .bf16, &.{hidden}),
+            .patch = try take(own, ck, "vit.embeddings.", "patch_embedding.weight", .bf16, &.{ hidden, 3, vc.patch, vc.patch }),
+            .patch_bias = try take(own, ck, "vit.embeddings.", "patch_embedding.bias", .bf16, &.{hidden}),
             .table = table,
-            .newline = try take(own, ck, "vit.perceive.image_newline", .bf16, &.{H}),
+            .newline = try take(own, ck, "vit.perceive.", "image_newline", .bf16, &.{H}),
             .perceive = undefined,
             .scratch = undefined,
             .patches_max = 4 * @as(usize, tokens),
+            .stages = null,
             .bytes = 0,
         };
         for (layers, 0..) |*layer, i| layer.* = try loadLayer(own, ck, i);
         self.perceive = .{
-            .norm = try take(own, ck, "vit.perceive.norm.weight", .bf16, &.{hidden}),
-            .merge = try take(own, ck, "vit.perceive.proj.0.weight", .bf16, &.{ merge_width, hidden, merge, merge }),
-            .merge_bias = try take(own, ck, "vit.perceive.proj.0.bias", .bf16, &.{merge_width}),
-            .out = try take(own, ck, "vit.perceive.proj.2.weight", .bf16, &.{ H, merge_width, 1, 1 }),
-            .out_bias = try take(own, ck, "vit.perceive.proj.2.bias", .bf16, &.{H}),
+            .norm = try take(own, ck, "vit.perceive.", "norm.weight", .bf16, &.{hidden}),
+            .merge = try take(own, ck, "vit.perceive.", "proj.0.weight", .bf16, &.{ merge_width, hidden, merge, merge }),
+            .merge_bias = try take(own, ck, "vit.perceive.", "proj.0.bias", .bf16, &.{merge_width}),
+            .out = try take(own, ck, "vit.perceive.", "proj.2.weight", .bf16, &.{ H, merge_width, 1, 1 }),
+            .out_bias = try take(own, ck, "vit.perceive.", "proj.2.bias", .bf16, &.{H}),
         };
         self.scratch = try allocScratch(d, own, self.patches_max);
+        self.scratch.newline = self.newline;
         self.bytes = own.bytes;
         return self;
     }
@@ -310,6 +315,21 @@ pub const Tower = struct {
         a.free(self.table);
         a.free(self.layers);
         a.destroy(self);
+    }
+
+    pub const Stages = struct { io: std.Io, dir: std.Io.Dir };
+
+    /// Writes `rows` x `width` BF16 rows of `buf` as FP32 under `name`, when this run dumps its stages.
+    fn stage(self: *Tower, buf: u64, rows: usize, width: usize, name: []const u8) !void {
+        const st = self.stages orelse return;
+        const bits = try std.heap.page_allocator.alloc(u8, rows * width * 2);
+        defer std.heap.page_allocator.free(bits);
+        try (cuda.DeviceBuffer{ .d = self.d, .ptr = buf, .len = rows * width * 2, .borrowed = true }).downloadAsync(0, bits, self.s.handle);
+        try self.s.synchronize();
+        const floats = try std.heap.page_allocator.alloc(f32, rows * width);
+        defer std.heap.page_allocator.free(floats);
+        for (floats, 0..) |*f, i| f.* = readBf16(std.mem.readInt(u16, bits[i * 2 ..][0..2], .little));
+        try st.dir.writeFile(st.io, .{ .sub_path = name, .data = std.mem.sliceAsBytes(floats) });
     }
 
     /// One image's rows into `out` (BF16, `(gh / 2) * (gw / 2 + 1)` of them, `H` wide): the reference's
@@ -327,26 +347,33 @@ pub const Tower = struct {
         defer tmp.free(up);
         for (patches, up) |v, *w| w.* = bf16(v);
         try sc.patches.uploadAsync(0, std.mem.sliceAsBytes(up), s.handle);
-        try self.glue.linear(self.gemms, self.glue, s, sc.acc, sc.patches.ptr, self.patch, self.patch_bias, sc.pos.ptr, count, hidden, patch_width);
+        try cuda.vit.linear(self.gemms, self.glue, s, sc.acc, sc.patches.ptr, self.patch, self.patch_bias, sc.h, count, hidden, patch_width);
+        try self.stage(sc.h, count, hidden, "patchemb.f32");
         const pos = try self.positionRows(gh, gw);
         defer tmp.free(pos);
         try sc.pos.uploadAsync(0, std.mem.sliceAsBytes(pos), s.handle);
-        try self.glue.pointwise(s, sc.pos.ptr, sc.pos.ptr, sc.pos.ptr, count * hidden, .none);
+        try self.stage(sc.pos.ptr, count, hidden, "pos.f32");
+        // x lives in `sc.pos` from here: the patch rows plus their position rows, rounded once, as torch's `emb + pos`.
+        try self.glue.pointwise(s, sc.h, sc.pos.ptr, sc.pos.ptr, count * hidden, .none);
+        try self.stage(sc.pos.ptr, count, hidden, "embed.f32");
         // 27 x (LayerNorm, full non-causal attention, LayerNorm, GELU MLP). The attention is one frame: every patch of
         // this image over every other, which is the reference's cu_seqlens segment for it.
-        for (self.layers) |layer| {
+        for (self.layers, 0..) |layer, layer_index| {
             try self.glue.layerNorm(s, sc.pos.ptr, layer.ln1, layer.ln1_bias, sc.h, count, hidden, self.cfg.eps);
-            try self.glue.linear(self.gemms, self.glue, s, sc.acc, sc.h, layer.qkv, layer.qkv_bias, sc.qkv, count, 3 * hidden, hidden);
+            if (layer_index == 0) try self.stage(sc.h, count, hidden, "l0-norm.f32");
+            try cuda.vit.linear(self.gemms, self.glue, s, sc.acc, sc.h, layer.qkv, layer.qkv_bias, sc.qkv, count, 3 * hidden, hidden);
             try self.attention.full(s, sc.qkv, sc.attention.ptr, count, heads, dim, 1.0 / @sqrt(@as(f32, dim)));
-            try self.glue.linearAct(self.gemms, self.glue, s, sc.acc, sc.attention.ptr, layer.out, layer.out_bias, sc.tmp, count, hidden, hidden, sc.pos.ptr, sc.pos.ptr, .none);
+            if (layer_index == 0) try self.stage(sc.attention.ptr, count, hidden, "l0-attn.f32");
+            try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.attention.ptr, layer.out, layer.out_bias, sc.tmp, count, hidden, hidden, sc.pos.ptr, sc.pos.ptr, .none);
             try self.glue.layerNorm(s, sc.pos.ptr, layer.ln2, layer.ln2_bias, sc.h, count, hidden, self.cfg.eps);
             var at: usize = 0;
             while (at < count) : (at += block_rows) {
                 const n = @min(block_rows, count - at);
                 const row = sc.pos.ptr + at * hidden * 2;
-                try self.glue.linearAct(self.gemms, self.glue, s, sc.acc, sc.h + at * hidden * 2, layer.up, layer.up_bias, sc.ff, n, inner, hidden, null, sc.ff, .gelu);
-                try self.glue.linearAct(self.gemms, self.glue, s, sc.acc, sc.ff, layer.down, layer.down_bias, sc.tmp, n, hidden, inner, row, row, .none);
+                try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.h + at * hidden * 2, layer.up, layer.up_bias, sc.ff, n, inner, hidden, null, sc.ff, .gelu);
+                try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.ff, layer.down, layer.down_bias, sc.tmp, n, hidden, inner, row, row, .none);
             }
+            if (layer_index == 0) try self.stage(sc.pos.ptr, count, hidden, "l0.f32") else if (layer_index == 1) try self.stage(sc.pos.ptr, count, hidden, "l1.f32");
         }
         try self.perceiveRows(gh, gw, count, out);
     }
@@ -366,9 +393,10 @@ pub const Tower = struct {
         var at: usize = 0;
         while (at < merged) : (at += block_rows) {
             const n = @min(block_rows, merged - at);
-            try self.glue.linearAct(self.gemms, self.glue, s, sc.acc, sc.merged + at * merge_width * 2, self.perceive.merge, self.perceive.merge_bias, sc.ff, n, merge_width, merge_width, null, sc.ff, .gelu);
-            try self.glue.linear(self.gemms, self.glue, s, sc.acc, sc.ff, self.perceive.out, self.perceive.out_bias, sc.proj + at * H * 2, n, H, merge_width);
+            try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.merged + at * merge_width * 2, self.perceive.merge, self.perceive.merge_bias, sc.ff, n, merge_width, merge_width, null, sc.ff, .gelu);
+            try cuda.vit.linear(self.gemms, self.glue, s, sc.acc, sc.ff, self.perceive.out, self.perceive.out_bias, sc.proj + at * H * 2, n, H, merge_width);
         }
+        try self.stage(sc.proj, merged, H, "proj.f32");
         // Every merged row's own row goes where the prompt's placeholders are, the newline vector one past its end.
         const dst = cuda.DeviceBuffer{ .d = self.d, .ptr = out, .len = mh * (mw + 1) * H * 2, .borrowed = true };
         var oh: usize = 0;
@@ -439,7 +467,7 @@ fn loadLayer(own: *cuda.exl3_upload.Uploader, ck: *core.Checkpoint, i: usize) !L
         .up = try take(own, ck, p, "mlp.dense_h_to_4h.weight", .bf16, &.{ inner, hidden }),
         .up_bias = try take(own, ck, p, "mlp.dense_h_to_4h.bias", .bf16, &.{inner}),
         .down = try take(own, ck, p, "mlp.dense_4h_to_h.weight", .bf16, &.{ hidden, inner }),
-        .down_bias = try take(own, ck, p, "mlp.dense_4h_to_h.bias", .bf16, &.{inner}),
+        .down_bias = try take(own, ck, p, "mlp.dense_4h_to_h.bias", .bf16, &.{hidden}),
     };
 }
 
@@ -457,7 +485,7 @@ fn take(own: *cuda.exl3_upload.Uploader, ck: *core.Checkpoint, prefix: []const u
 /// The tower's per-image scratch: one image's rows at a time, and the token-wise GEMMs' block.
 fn allocScratch(d: *const cuda.Driver, own: *cuda.exl3_upload.Uploader, patches_max: usize) !Scratch {
     const p = patches_max;
-    const b = @min(block_rows, patches_max);
+    const b: usize = @min(block_rows, patches_max);
     const merges = p / (merge * merge);
     var sc: Scratch = undefined;
     sc.patches = try cuda.DeviceBuffer.alloc(d, p * patch_width * 2);
@@ -472,6 +500,7 @@ fn allocScratch(d: *const cuda.Driver, own: *cuda.exl3_upload.Uploader, patches_
     sc.acc = try zeros(own, @max(p * hidden, b * merge_width) * 4);
     sc.merged = try zeros(own, merges * merge_width * 2);
     sc.proj = try zeros(own, merges * H * 2);
+    sc.newline = 0; // filled by `Tower.load` once `image_newline` is up
     return sc;
 }
 

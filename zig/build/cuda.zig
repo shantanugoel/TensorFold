@@ -159,6 +159,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     @import("cuda_contract_deepseek.zig").images(b, runner_exe, contract_images, kernels, &images, prebuilt, nvcc, version, sms, opts.cuobjdump);
     @import("dsv41_serve.zig").install(b, target, optimize, cuda, nvcc != null or prebuilt != null);
     @import("hy4_cuda.zig").install(b, target, optimize, cuda, mods.core);
+    @import("hy4_cuda.zig").installVision(b, target, optimize, cuda, mods.core, mods.lanes);
     @import("hy4_cuda.zig").installReuse(b, target, optimize, cuda, mods.core, mods.lanes);
     @import("hy4_cuda.zig").installDraft(b, target, optimize, cuda, mods.core, mods.lanes);
     @import("hy4_cuda.zig").installLanes(b, target, optimize, cuda, mods.core, mods.lanes);
