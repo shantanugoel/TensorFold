@@ -8,6 +8,7 @@ const mla = @import("mla_cuda.zig");
 const m = @import("mla_weights.zig");
 const attn = @import("mla_attention.zig");
 const rope = @import("rope.zig");
+const vision = @import("cuda_vision.zig");
 
 const H = geom.H;
 const Q = geom.Q;
@@ -432,6 +433,19 @@ pub fn source(d: *const Draft, slot: usize, kept: ?usize) Source {
     return if (kept) |k| .{ .head = q.head0 + k, .list = k } else .{ .head = q.anchor, .list = 0 };
 }
 
+/// The block's `width` positions from `anchor`. A decode row after a prompt sits one past its predecessor's position,
+/// and a prompt with images moves that tail by its plan's delta (`rope_deltas`): the plan answers for the row. A text
+/// prompt's row is its own slot, and the arithmetic is the identity there.
+pub fn blockPositions(plan: ?vision.Plan, anchor: usize, out: *[width * 3]i32) void {
+    for (0..width) |i| {
+        const row = anchor + i;
+        out[i * 3 ..][0..3].* = if (plan) |p| p.positionAt(row) else own: {
+            const at: i32 = @intCast(row);
+            break :own .{ at, at, at };
+        };
+    }
+}
+
 /// `depth` proposals after `anchor`; the block's own rows go into the target's caches at `anchor .. anchor + width`.
 pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, depth: u32, from: Source, held: []u32) !void {
     const s = mm.s;
@@ -445,12 +459,9 @@ pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, de
     // Positions, write slots and the rotary table for the block's six rows.
     const base = mm.seqBase(slot);
     var positions: [width * 3]i32 = undefined;
+    blockPositions(if (mm.imagesOf(slot)) |im| im.plan else null, anchor, &positions);
     var writes: [width]u32 = undefined;
-    for (0..width) |i| {
-        const at: i32 = @intCast(anchor + i);
-        positions[i * 3 ..][0..3].* = .{ at, at, at };
-        writes[i] = @intCast(base + anchor + i);
-    }
+    for (0..width) |i| writes[i] = @intCast(base + anchor + i);
     try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(&positions), s.handle);
     try sc.write_slots.uploadAsync(0, std.mem.sliceAsBytes(&writes), s.handle);
     // Each layer's rows attend the target list its own target layer kept for the source row, plus its own prefix.
@@ -642,6 +653,25 @@ test "a draft row's keys are the reference's reuse list, minus its -1 padding" {
     try std.testing.expectEqual(@as(usize, 3), held); // its own position 6, then the block's 8 and 9
     try std.testing.expectEqual(@as(u32, 262_150), mine[0]);
     try std.testing.expectEqual(@as(u32, 262_153), mine[held - 1]);
+}
+
+test "the block's positions are the plan's, so an image prompt's delta moves them and a text prompt's are the row" {
+    const a = std.testing.allocator;
+    // One 4x6-patch image at row 2 of a 14-row prompt: the block is 4 wide, so the tail runs 6..10 and delta = -4.
+    var plan = try vision.Plan.build(a, &.{.{ .at = 2, .tokens = 8, .gh = 4, .gw = 6, .hash = 7 }}, 14);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(i32, -4), plan.delta);
+    var out: [width * 3]i32 = undefined;
+    // The first block row is prompt row 14: the plan puts it at 10, and the fork's `anchor + i + delta` is the same
+    // arithmetic (14 - 4). A text prompt or a text-only model reads the row's own slot.
+    blockPositions(plan, 14, &out);
+    for (0..width) |i| try std.testing.expectEqual([3]i32{ 10 + @as(i32, @intCast(i)), 10 + @as(i32, @intCast(i)), 10 + @as(i32, @intCast(i)) }, out[i * 3 ..][0..3].*);
+    blockPositions(null, 14, &out);
+    for (0..width) |i| try std.testing.expectEqual([3]i32{ 14 + @as(i32, @intCast(i)), 14 + @as(i32, @intCast(i)), 14 + @as(i32, @intCast(i)) }, out[i * 3 ..][0..3].*);
+    // A block inside the prompt's text tail is its own row of that tail, one past its predecessor's position too.
+    blockPositions(plan, 10, &out);
+    try std.testing.expectEqual([3]i32{ 6, 6, 6 }, out[0..3].*);
+    try std.testing.expectEqual([3]i32{ 11, 11, 11 }, out[5 * 3 ..][0..3].*);
 }
 
 test "the block's list fits the stride the attention is sized for" {
