@@ -114,7 +114,6 @@ fn refusal(a: Allocator, o: api.Open) !?[]const u8 {
     }
     if (o.lanes < 1 or o.lanes > family.max_slots) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves 1 to {d} sequences", .{ o.lanes, family.max_slots });
     if (o.tp != 1 or o.rank != 0) return try std.fmt.allocPrint(a, "--tp {d} --rank {d}: the native Hy4-flash engine is one device (1 and 0)", .{ o.tp, o.rank });
-    if (o.kv8) return try std.fmt.allocPrint(a, "--kv-cache fp8: this engine's caches are BF16; 8-bit KV is plan step 7.7", .{});
     if (o.drafter != null or o.mtp_confidence != null) return try std.fmt.allocPrint(a, "--drafter and --mtp-confidence: DFly2 is the pack's own component, so --mtp-drafts {d} names its drafts and no separate checkpoint or confidence head is served", .{family.drafts});
     if ((o.mtp_drafts orelse 0) > family.drafts) return try std.fmt.allocPrint(a, "--mtp-drafts {d}: DFly2 proposes {d} drafts a round at most", .{ o.mtp_drafts.?, family.drafts });
     if (o.slide) return try std.fmt.allocPrint(a, "--slide: Hy4-flash does not learn on CUDA; serve without --slide", .{});
@@ -187,7 +186,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const drafts = loadDrafts(o.lanes, draft_lanes, asked);
     if (asked > 0 and drafts == 0) std.log.info("hy4-cuda: --mtp-drafts {d} not loaded: a --parallel {d} server serves the plain path (a resident tower costs a shared pass about 10 %, step 6c; use --parallel 1, or TF_HY4_DRAFT_LANES=3 to draft in a two-lane round)", .{ asked, o.lanes });
     const vision_tokens: u32 = if (o.vision) |v| imageTokens(v) else 0;
-    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes, vision_tokens) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
+    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes, vision_tokens, o.kv8) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
     const bytes = h.c.bytes();
@@ -297,12 +296,12 @@ test "Hy4-flash CUDA host: a bare serve is served, and every step this path lack
     try std.testing.expect(try refusal(a, .{ .dir = "d", .model_type = model_type, .lanes = family.max_slots }) == null);
     // --vision itself is served (`--vision` alone takes the checkpoint's own budget); past the tower's scratch is not.
     try std.testing.expect(try refusal(a, .{ .dir = "d", .model_type = model_type, .lanes = 1, .vision = .{} }) == null);
-    // one flag a request cannot bring yet, and the words name the flag: too many image tokens, too many lanes, an
-    // 8-bit cache
+    // `--kv-cache fp8` is served now: the 12 indexed layers' rows are E4M3, the ring and the indexer stay BF16.
+    try std.testing.expect(try refusal(a, .{ .dir = "d", .model_type = model_type, .lanes = 1, .kv8 = true }) == null);
+    // one flag a request cannot bring yet, and the words name the flag: too many image tokens, too many lanes
     for ([_]struct { api.Open, []const u8 }{
         .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .vision = .{ .image_tokens = family.vision_token_limit + 1, .image_tokens_set = true } }, "--vision-image-tokens" },
         .{ .{ .dir = "d", .model_type = model_type, .lanes = family.max_slots + 1 }, "--parallel 9" },
-        .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .kv8 = true }, "--kv-cache fp8" },
         .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .slide = true }, "--slide" },
     }) |case| {
         const why = (try refusal(a, case[0])).?;

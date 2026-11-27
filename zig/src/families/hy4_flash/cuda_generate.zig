@@ -3,11 +3,12 @@ const std = @import("std");
 const cuda = @import("cuda");
 const model = @import("cuda_model.zig");
 
-const usage = "usage: tf-hy4-cuda-generate MODEL_DIR PROMPT_IDS.u32 NEW_TOKENS OUT_DIR [CHUNK] [--score] [--logits-last N] [--no-ring]\n" ++
+const usage = "usage: tf-hy4-cuda-generate MODEL_DIR PROMPT_IDS.u32 NEW_TOKENS OUT_DIR [CHUNK] [--score] [--logits-last N] [--no-ring] [--kv-cache fp8]\n" ++
     "  CHUNK            rows a pass takes, at most 1024 (default 1024)\n" ++
     "  --score          also write logits.f32 (every row but the last), scores.f32 and report.json\n" ++
     "  --logits-last N  with --score: keep only the last N of those rows, as exl3_reference.py does\n" ++
-    "  --no-ring        keep the sliding layers' full-length KV: the arm the ring is gated against\n";
+    "  --no-ring        keep the sliding layers' full-length KV: the arm the ring is gated against\n" ++
+    "  --kv-cache fp8   the indexed layers' KV as E4M3 rows (the plan 7.7 arm; the ring stays BF16)\n";
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -21,12 +22,17 @@ pub fn main(init: std.process.Init) !void {
     var score = false;
     var last: usize = 0;
     var ring = true;
+    var kv8 = false;
     var i: usize = 5;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--score")) {
             score = true;
         } else if (std.mem.eql(u8, args[i], "--no-ring")) {
             ring = false;
+        } else if (std.mem.eql(u8, args[i], "--kv-cache")) {
+            if (i + 1 == args.len or !std.mem.eql(u8, args[i + 1], "fp8")) return error.BadArgs;
+            i += 1;
+            kv8 = true;
         } else if (std.mem.eql(u8, args[i], "--logits-last")) {
             if (i + 1 == args.len) return error.BadArgs;
             i += 1;
@@ -59,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
     const t0 = std.Io.Clock.awake.now(io);
     const capacity = prompt.len + new_tokens;
     const max_rows = @min(chunk, prompt.len);
-    const hy4 = try model.Model.open(a, io, &driver, s, &kernels, args[1], .{ .capacity = capacity, .max_rows = max_rows, .ring = ring });
+    const hy4 = try model.Model.open(a, io, &driver, s, &kernels, args[1], .{ .capacity = capacity, .max_rows = max_rows, .ring = ring, .kv8 = kv8 });
     const load_ns = t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     std.debug.print("loaded {d} layers, {d:.2} GiB device weights in {d:.1} s\n", .{ hy4.layers.len, @as(f64, @floatFromInt(hy4.weight_bytes)) / (1 << 30), @as(f64, @floatFromInt(load_ns)) / 1e9 });
     const V: usize = hy4.text.vocab_size;

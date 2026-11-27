@@ -13,6 +13,7 @@ test {
     _ = @import("rope.zig");
     _ = @import("rank_weights.zig");
     _ = @import("cuda_model.zig");
+    _ = @import("cuda_kv8.zig");
     _ = @import("serve_cuda.zig");
     _ = @import("cuda_draft.zig");
     _ = @import("index_recall.zig");

@@ -7,6 +7,7 @@ const dfly = @import("cuda_draft.zig");
 const geom = @import("cuda_scratch.zig");
 const mla = @import("mla_weights.zig");
 const cuda_vision = @import("cuda_vision.zig");
+const kv8 = @import("cuda_kv8.zig");
 const be = lanes.backend;
 
 /// A prompt chunk's rows: the dev binary's cap and the model's `max_rows`.
@@ -38,7 +39,10 @@ pub const Bytes = struct { kv: u64 = 0, index: u64 = 0, ring: u64 = 0, scores: u
 pub fn cacheBytes(m: *const model.Model) Bytes {
     var b: Bytes = .{};
     for (m.layers) |layer| {
-        if (layer.attention.sliding) b.ring += @as(u64, layer.attention.rows) * mla.absorbed_stride * 2 else b.kv += @as(u64, layer.attention.rows) * mla.absorbed_stride * 2;
+        if (layer.attention.sliding)
+            b.ring += @as(u64, layer.attention.rows) * mla.absorbed_stride * 2
+        else
+            b.kv += @as(u64, layer.attention.rows) * kv8.rowBytes(m.kv8);
         if (layer.attention.index) |ix| b.index += ix.token_keys.len + ix.group_keys.len;
     }
     b.scores = m.index.scoreBytes();
@@ -152,13 +156,13 @@ pub const Cuda = struct {
     pub const default_image_tokens: u32 = cuda_vision.token_limit;
 
     /// Loads the pack: `slots` sequences' caches of `capacity` positions, `prompt_rows` rows a pass, `drafts` a round.
-    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize, vision_tokens: u32) !*Cuda {
+    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize, vision_tokens: u32, kv8: bool) !*Cuda {
         // A sequence's cache must close on the indexer's four-slot group, or its pooled keys and recall lists overlap.
         if (!capacityFits(capacity, slots)) return error.Hy4UngroupedCapacity;
         if (vision_tokens > cuda_vision.token_limit) return error.BadHy4VisionLimits;
         const self = try a.create(Cuda);
         errdefer a.destroy(self);
-        const m = try model.Model.open(a, io, d, s, k, dir, .{ .capacity = capacity, .max_rows = prompt_rows, .drafts = rounds, .slots = slots, .vision = vision_tokens > 0, .vision_tokens = vision_tokens });
+        const m = try model.Model.open(a, io, d, s, k, dir, .{ .capacity = capacity, .max_rows = prompt_rows, .drafts = rounds, .slots = slots, .vision = vision_tokens > 0, .vision_tokens = vision_tokens, .kv8 = kv8 });
         errdefer model.Model.free(m);
         const vocab: usize = m.text.vocab_size;
         // Every row a round can hold: the engine's batch width, which is this many sequences' windows at least.
@@ -746,6 +750,7 @@ test "a context's caches split into the KV that grows, the ring that does not an
     var m: model.Model = undefined;
     m.layers = &layers;
     m.capacity = 262_144;
+    m.kv8 = false;
     m.index.scores = .{ .d = undefined, .ptr = 0, .len = scores, .owner = null, .borrowed = false };
     const b = cacheBytes(&m);
     try std.testing.expectEqual(@as(u64, 12 * 262_144 * 1152), b.kv);
@@ -757,6 +762,12 @@ test "a context's caches split into the KV that grows, the ring that does not an
     try std.testing.expect(ring_window == 512 and ring_rows == 3 * ring_window);
     // A size decision's rate counts everything that grows: 13,824 B of KV, 3,840 B of indexer keys, 1,024 B of scores.
     try std.testing.expectEqual(@as(u64, 18_688), bytesPerToken(&m));
+    // `--kv-cache fp8`: 644 B an indexed row (codes, a scale, a BF16 rope plane); the ring does not move.
+    m.kv8 = true;
+    const q = cacheBytes(&m);
+    try std.testing.expectEqual(@as(u64, 12 * 262_144 * 644), q.kv);
+    try std.testing.expectEqual(ring, q.ring);
+    try std.testing.expectEqual(@as(u64, 12_592), bytesPerToken(&m));
 }
 
 test "a slot belongs to a stream only while the history it filled is that stream's prompt" {

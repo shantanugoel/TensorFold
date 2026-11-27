@@ -44,12 +44,13 @@ constexpr int wide_smem() {
 }
 
 // RW roped columns (Ling's 64) follow the latent in q and keys; SPLIT: block z is chunk z * sw + sr, keys page z.
+// FP8: the latent is E4M3 codes and a scale a row; `ropes`, when given, is the roped columns' BF16 side plane.
 template <int HB, bool FP8 = false, int RW = 0, bool SPLIT = false>
 __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr,
-                            int sw = 1, int sr = 0) {
-  static_assert(!(FP8 && RW != 0), "the E4M3 cache holds the latent alone");
+                            int sw = 1, int sr = 0, const __nv_bfloat16* ropes = nullptr) {
+  // A roped E4M3 row keeps its 64 roped columns in a BF16 side plane (`ropes`): the codes hold the latent alone.
   static_assert(!(SPLIT && FP8), "a split cache holds BF16 rows");
   constexpr int MT = HB / 16, KW = LW + RW;
   extern __shared__ __align__(16) unsigned char smem[];
@@ -76,15 +77,19 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
       if constexpr (FP8) {
-        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
-        const float row_scale = ok ? scales[src] : 1.0f;
+        if (RW == 0 || u < LW / 8) {
+          const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
+          const float row_scale = ok ? scales[src] : 1.0f;
 #pragma unroll
-        for (int j = 0; j < 8; j += 2) {
-          const uint16_t bits = ok ? (uint16_t)codes[src * LW + u * 8 + j] |
-                                        ((uint16_t)codes[src * LW + u * 8 + j + 1] << 8) : 0;
-          const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
-          dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
-          dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
+          for (int j = 0; j < 8; j += 2) {
+            const uint16_t bits = ok ? (uint16_t)codes[src * LW + u * 8 + j] |
+                                          ((uint16_t)codes[src * LW + u * 8 + j + 1] << 8) : 0;
+            const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+            dst[wide<KW>(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
+            dst[wide<KW>(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
+          }
+        } else if constexpr (RW != 0) {
+          cp16(dst + wide<KW>(key, u), ropes + src * RW + (u - LW / 8) * 8, ok);
         }
       } else {
         cp16(dst + wide<KW>(key, u), keys_at + src * KW + u * 8, ok);

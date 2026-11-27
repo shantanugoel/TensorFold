@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     defer s.deinit();
     var kernels = try family.Kernels.load(a, &driver);
     defer kernels.deinit();
-    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, 0, slots, 0);
+    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, 0, slots, 0, false);
     defer c.deinit();
     const b = c.backend();
     std.debug.print("loaded: {d}-slot context x {d} sequences, {d} layers\n", .{ capacity, slots, c.m.layers.len });

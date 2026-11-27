@@ -13,6 +13,7 @@ const engram = @import("engram.zig");
 const engram_cuda = @import("engram_cuda.zig");
 const direct = @import("bf16_rows.zig");
 const geom = @import("cuda_scratch.zig");
+const kv8 = @import("cuda_kv8.zig");
 const cuda_index = @import("cuda_index.zig");
 const model = @import("cuda_model.zig");
 const dfly = @import("cuda_draft.zig");
@@ -93,6 +94,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         .index = undefined,
         .max_rows = max_rows,
         .capacity = capacity,
+        .kv8 = o.kv8,
         .slots = o.slots,
         .ring = o.ring,
         .history = try a.alloc(std.ArrayList(u32), o.slots),
@@ -171,19 +173,22 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     var index_bytes: usize = 0;
     var sliding: usize = 0;
     var indexers: usize = 0;
+    var fp8: usize = 0;
     for (self.layers) |layer| {
-        kv_bytes += @as(usize, layer.attention.rows) * m.absorbed_stride * 2;
+        kv_bytes += @as(usize, layer.attention.rows) * kv8.rowBytes(layer.attention.kv8 != null);
         sliding += @intFromBool(layer.attention.sliding);
+        fp8 += @intFromBool(layer.attention.kv8 != null);
         if (layer.attention.index) |ix| {
             index_bytes += ix.token_keys.len + ix.group_keys.len;
             indexers += 1;
         }
     }
-    std.debug.print("capacity {d}: KV {d:.2} GiB ({d} B a token over {d} indexed layers, {d} sliding at {d} rows), indexer keys {d:.2} GiB ({d} B a token over {d} layers), recall scores {d:.0} MiB\n", .{
+    std.debug.print("capacity {d}: KV {d:.2} GiB ({d} B a token over {d} indexed layers, {d} of them E4M3, {d} sliding at {d} rows), indexer keys {d:.2} GiB ({d} B a token over {d} layers), recall scores {d:.0} MiB\n", .{
         self.capacity,
         load_util.gib(kv_bytes),
-        (self.layers.len - sliding) * m.absorbed_stride * 2,
+        (self.layers.len - sliding) * kv8.rowBytes(self.kv8),
         self.layers.len - sliding,
+        fp8,
         sliding,
         if (self.ring) geom.ring.rows else self.capacity,
         load_util.gib(index_bytes),
@@ -229,8 +234,22 @@ fn loadLayer(self: *Model, a: std.mem.Allocator, ck: *core.Checkpoint, shards: ?
     defer tmp.free(split.key);
     defer tmp.free(split.value);
     // Every sequence's own rows: an indexed layer's context, or a sliding layer's ring, one sequence after another.
-    var cache = try cuda.DeviceBuffer.alloc(self.d, self.slots * (if (sliding and self.ring) geom.ring.rows else self.capacity) * m.absorbed_stride * 2);
+    // `--kv-cache fp8` gives an indexed layer the E4M3 row and its two side planes; a sliding layer's ring stays BF16.
+    const fp8 = self.kv8 and !sliding;
+    var cache = try cuda.DeviceBuffer.alloc(self.d, self.slots * (if (sliding and self.ring) geom.ring.rows else self.capacity) * (if (fp8) @as(usize, m.latent) else m.absorbed_stride * 2));
+    errdefer cache.free();
     try cache.fill8(0, null);
+    var kv8_cache: ?model.Kv8 = null;
+    if (fp8) {
+        const rows = self.slots * self.capacity;
+        var scales = try cuda.DeviceBuffer.alloc(self.d, rows * @sizeOf(f32));
+        errdefer scales.free();
+        try scales.fill8(0, null);
+        var ropes = try cuda.DeviceBuffer.alloc(self.d, rows * m.rope * 2);
+        errdefer ropes.free();
+        try ropes.fill8(0, null);
+        kv8_cache = .{ .scales = scales, .ropes = ropes };
+    }
     const att: Attention = .{
         .sliding = sliding,
         .heads = heads,
@@ -252,7 +271,8 @@ fn loadLayer(self: *Model, a: std.mem.Allocator, ck: *core.Checkpoint, shards: ?
         .output_norm = try up(self, ck, p ++ "self_attn.post_proj_norm.weight", .{i}, .bf16, &.{H}),
         .sinks = try up(self, ck, p ++ "self_attn.learnable_sink_param", .{i}, .f32, &.{hh}),
         .cache = cache,
-        .rows = @intCast(cache.len / (m.absorbed_stride * 2)),
+        .rows = @intCast(cache.len / (if (fp8) @as(usize, m.latent) else m.absorbed_stride * 2)),
+        .kv8 = kv8_cache,
         // Below the key budget nothing selects, so a short context carries no indexer state at all.
         .index = if (sliding or self.capacity <= sparse_stride) null else try cuda_index.Layer.load(a, self.d, &self.own, ck, i, t, self.capacity, self.slots),
     };

@@ -489,6 +489,9 @@ pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, de
         try k.gemm.run(s, sc.q_resid.ptr, l.q_b, sc.q.ptr, width, hh * m.query_stride, Q, .bf16);
         try k.gemm.run(s, sc.normed.ptr, l.kv_a, sc.kv.ptr, width, m.absorbed_stride, H, .bf16);
         try k.gemm.run(s, sc.normed.ptr, l.gate, sc.gate.ptr, width, channels, H, .bf16);
+        // The target's own cache format: a `--kv-cache fp8` target holds E4M3 rows, and the block's writes land in it.
+        const scales: u64 = if (target.kv8) |q| q.scales.ptr else 0;
+        const ropes: u64 = if (target.kv8) |q| q.ropes.ptr else 0;
         try mla.forward(k.project, k.attention, s, .{
             .query = sc.q.ptr,
             .key_weights = l.key,
@@ -496,7 +499,7 @@ pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, de
             .value_logits = sc.gate.ptr,
             .positions = sc.positions.ptr,
             .rotary_table = sc.table.ptr,
-            .kv = .{ .projection = sc.kv.ptr, .gain = l.kv_norm, .write_slots = sc.write_slots.ptr, .capacity = target.rows, .epsilon = eps },
+            .kv = .{ .projection = sc.kv.ptr, .gain = l.kv_norm, .write_slots = sc.write_slots.ptr, .capacity = target.rows, .epsilon = eps, .scales = scales, .ropes = ropes },
             .attention = .{
                 .query = sc.absorb.ptr,
                 .cache = target.cache.ptr,
@@ -506,6 +509,8 @@ pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, de
                 .scratch = sc.attn_scratch.ptr,
                 .scratch_bytes = sc.attn_bytes,
                 .output = sc.latent_out.ptr,
+                .scales = scales,
+                .ropes = ropes,
             },
             .values = sc.values.ptr,
         }, shape, d.rope);

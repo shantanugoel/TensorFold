@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     defer s.deinit();
     var kernels = try family.Kernels.load(a, &driver);
     defer kernels.deinit();
-    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, 0, 1, 0);
+    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, 0, 1, 0, false);
     defer c.deinit();
     std.debug.print("loaded: {d}-slot context, reuse from row {d}, {d} tokens\n", .{ capacity, from, tokens });
 

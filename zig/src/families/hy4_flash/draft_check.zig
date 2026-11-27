@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     defer s.deinit();
     var kernels = try family.Kernels.load(a, &driver);
     defer kernels.deinit();
-    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, dfly.drafts, 1, 0);
+    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, dfly.drafts, 1, 0, false);
     defer c.deinit();
     const m = c.m;
     const V: usize = m.text.vocab_size;

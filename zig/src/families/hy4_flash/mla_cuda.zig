@@ -11,6 +11,7 @@ pub const Projections = struct {
     table_kernel: cuda.Function,
     rotate_kernel: cuda.Function,
     cache_kernel: cuda.Function,
+    cache_fp8_kernel: cuda.Function,
     gate_kernel: cuda.Function,
 
     pub fn load(driver: *const cuda.Driver) !Projections {
@@ -23,6 +24,7 @@ pub const Projections = struct {
             .table_kernel = try image.function("tf_hy4_rotary_table"),
             .rotate_kernel = try image.function("tf_hy4_rotate"),
             .cache_kernel = try image.function("tf_hy4_cache_keys"),
+            .cache_fp8_kernel = try image.function("tf_hy4_cache_keys_fp8"),
             .gate_kernel = try image.function("tf_hy4_gate_values"),
         };
     }
@@ -77,6 +79,15 @@ pub const Projections = struct {
         try cuda.launch.launch(self.cache_kernel, .{ .grid = .{ .x = shape.rows }, .block = .{ .x = 128 } }, s, &args);
     }
 
+    /// The same rows in the E4M3 cache row: codes and a scale a row for the latent, the roped columns in `ropes`.
+    pub fn cacheKeysFp8(self: Projections, s: cuda.Stream, input: u64, gain: u64, table: u64, slots: u64, cache: u64, scales: u64, ropes: u64, shape: attention.CacheWrite) !void {
+        try shape.check();
+        if (scales == 0 or ropes == 0) return error.NoHy4Fp8Cache;
+        var args: cuda.Args = .{};
+        inline for (.{ input, gain, table, slots, cache, scales, ropes, shape }) |x| args.add(x);
+        try cuda.launch.launch(self.cache_fp8_kernel, .{ .grid = .{ .x = shape.rows }, .block = .{ .x = 512 } }, s, &args);
+    }
+
     pub fn gate(self: Projections, s: cuda.Stream, values: u64, logits: u64, rows: u32, heads: u32) !void {
         if (rows == 0) return;
         if (rows > 65535 or heads == 0 or heads > 64) return error.BadHy4GateShape;
@@ -90,6 +101,7 @@ pub const Projections = struct {
 pub const Attention = struct {
     image: cuda.Module,
     chunks: cuda.Function,
+    chunks_fp8: cuda.Function,
     merge: cuda.Function,
 
     const head_tile = cuda.mla.heads_tile;
@@ -104,6 +116,9 @@ pub const Attention = struct {
         scratch: u64,
         scratch_bytes: usize,
         output: u64,
+        /// An E4M3 cache's scale a row and the roped columns' BF16 plane; both 0 on a BF16 cache.
+        scales: u64 = 0,
+        ropes: u64 = 0,
     };
 
     pub fn load(driver: *const cuda.Driver) !Attention {
@@ -111,7 +126,9 @@ pub const Attention = struct {
         errdefer image.unload();
         const chunks = try image.function("tf_hy4_attend_chunks");
         try chunks.allowDynamicShared(shared_bytes);
-        return .{ .image = image, .chunks = chunks, .merge = try image.function("tf_hy4_attend_merge") };
+        const chunks_fp8 = try image.function("tf_hy4_attend_chunks_fp8");
+        try chunks_fp8.allowDynamicShared(shared_bytes);
+        return .{ .image = image, .chunks = chunks, .chunks_fp8 = chunks_fp8, .merge = try image.function("tf_hy4_attend_merge") };
     }
 
     pub fn deinit(self: *Attention) void {
@@ -128,14 +145,19 @@ pub const Attention = struct {
         const mass = maxima + partials;
         const rows: i64 = shape.rows;
         const heads: i64 = shape.heads;
-        var args: cuda.Args = .{};
-        inline for (.{ b.query, b.cache, b.slots, b.counts, b.scratch, maxima, mass, rows, heads, @as(i64, shape.key_stride), attention.score_scale }) |x|
-            args.add(x);
-        try cuda.launch.launch(self.chunks, .{
-            .grid = .{ .x = shape.rows, .y = (shape.heads + head_tile - 1) / head_tile, .z = shape.chunks },
-            .block = .{ .x = 256 },
-            .shared = shared_bytes,
-        }, s, &args);
+        const grid: cuda.launch.Dim3 = .{ .x = shape.rows, .y = (shape.heads + head_tile - 1) / head_tile, .z = shape.chunks };
+        const cfg: cuda.launch.Config = .{ .grid = grid, .block = .{ .x = 256 }, .shared = shared_bytes };
+        if (b.scales != 0) {
+            var fp8: cuda.Args = .{};
+            inline for (.{ b.query, b.cache, b.scales, b.ropes, b.slots, b.counts, b.scratch, maxima, mass, rows, heads, @as(i64, shape.key_stride), attention.score_scale }) |x|
+                fp8.add(x);
+            try cuda.launch.launch(self.chunks_fp8, cfg, s, &fp8);
+        } else {
+            var args: cuda.Args = .{};
+            inline for (.{ b.query, b.cache, b.slots, b.counts, b.scratch, maxima, mass, rows, heads, @as(i64, shape.key_stride), attention.score_scale }) |x|
+                args.add(x);
+            try cuda.launch.launch(self.chunks, cfg, s, &args);
+        }
         var merge: cuda.Args = .{};
         inline for (.{ b.scratch, maxima, mass, b.sinks, b.output, rows, heads, @as(i32, @intCast(shape.chunks)) }) |x| merge.add(x);
         try cuda.launch.launch(self.merge, .{
@@ -151,6 +173,9 @@ pub const KvInput = struct {
     write_slots: u64,
     capacity: u32,
     epsilon: f32,
+    /// An E4M3 cache's scale a row and the roped columns' BF16 plane; both 0 on a BF16 cache.
+    scales: u64 = 0,
+    ropes: u64 = 0,
 };
 
 pub const MlaPass = struct {
@@ -177,11 +202,18 @@ pub fn forward(project: Projections, attend: Attention, s: cuda.Stream, b: MlaPa
         .input_stride = weights.query_stride,
         .output_stride = weights.absorbed_stride,
     });
-    if (b.kv) |kv| try project.cacheKeys(s, kv.projection, kv.gain, b.rotary_table, kv.write_slots, b.attention.cache, .{
-        .rows = shape.rows,
-        .capacity = kv.capacity,
-        .epsilon = kv.epsilon,
-    });
+    if (b.kv) |kv| if (kv.scales != 0)
+        try project.cacheKeysFp8(s, kv.projection, kv.gain, b.rotary_table, kv.write_slots, b.attention.cache, kv.scales, kv.ropes, .{
+            .rows = shape.rows,
+            .capacity = kv.capacity,
+            .epsilon = kv.epsilon,
+        })
+    else
+        try project.cacheKeys(s, kv.projection, kv.gain, b.rotary_table, kv.write_slots, b.attention.cache, .{
+            .rows = shape.rows,
+            .capacity = kv.capacity,
+            .epsilon = kv.epsilon,
+        });
     try attend.attend(s, b.attention, shape);
     try project.expand(s, b.attention.output, b.value_weights, b.values, shape.rows, shape.heads);
     try project.gate(s, b.values, b.value_logits, shape.rows, shape.heads);

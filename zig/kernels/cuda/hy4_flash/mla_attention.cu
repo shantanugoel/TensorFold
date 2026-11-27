@@ -12,6 +12,17 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_attend_chunks(
         1, nullptr, 0);
 }
 
+// The same read over a `--kv-cache fp8` layer: E4M3 codes and one FP32 scale a row for the latent, the roped 64
+// columns from their own BF16 plane. The shared tile it rebuilds is the BF16 read's, so the math past it is unchanged.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_attend_chunks_fp8(
+    const __nv_bfloat16 *qa, const unsigned char *codes, const float *scales, const __nv_bfloat16 *ropes,
+    const int *slots, const int *counts, float *numerator, float *maxima, float *mass, int64_t rows, int64_t heads,
+    int64_t key_stride, float scale) {
+    glm_attn::chunks_wide<16, true, 64>(
+        qa, reinterpret_cast<const __nv_bfloat16 *>(codes), nullptr, slots, counts, numerator, maxima, mass, rows,
+        heads, key_stride, scale, 1, nullptr, 0, scales, 1, 0, ropes);
+}
+
 // Merge tiled maxima and mass, counting each head's learned zero-value sink exactly once.
 extern "C" __global__ void __launch_bounds__(128) tf_hy4_attend_merge(
     const float *numerator, const float *maxima, const float *mass, const float *sinks,

@@ -92,6 +92,10 @@ pub const Kernels = struct {
 
 pub const Hc = struct { project: u64, bias: u64, scale: u64 };
 
+/// An indexed layer's E4M3 cache (`--kv-cache fp8`): a scale a row, and the roped 64 columns in a BF16 side plane
+/// that `cache` (the codes) no longer holds.
+pub const Kv8 = struct { scales: cuda.DeviceBuffer, ropes: cuda.DeviceBuffer };
+
 pub const Attention = struct {
     sliding: bool,
     heads: u32,
@@ -110,6 +114,8 @@ pub const Attention = struct {
     sinks: u64,
     cache: cuda.DeviceBuffer, // a sliding layer's ring rows, or the context's rows behind an indexed layer
     rows: u32, // `cache`'s rows: the bound the write kernel refuses a slot past
+    /// An indexed layer's E4M3 rows: null on a BF16 cache, which is every sliding layer and the whole default arm.
+    kv8: ?Kv8 = null,
     index: ?*cuda_index.Layer = null,
 };
 
@@ -163,6 +169,8 @@ pub const Model = struct {
     index: cuda_index.Scratch,
     max_rows: usize,
     capacity: usize,
+    /// `--kv-cache fp8`: the 12 indexed layers' KV as E4M3 rows. The sliding layers' ring stays BF16.
+    kv8: bool,
     /// Sequences the caches hold, one after another: `--parallel`.
     slots: usize,
     /// The sliding layers' KV as `geom.ring.rows` slots; false is the full-length arm the ring is gated against.
@@ -198,6 +206,8 @@ pub const Model = struct {
         ring: bool = true,
         drafts: u32 = 0,
         slots: usize = 1,
+        /// `--kv-cache fp8`: an E4M3 row for the indexed layers' KV.
+        kv8: bool = false,
         /// `--vision`: load the image tower, for images of at most `vision_tokens` LM tokens.
         vision: bool = false,
         vision_tokens: u32 = 0,
@@ -515,6 +525,8 @@ pub const Model = struct {
                 };
             }
             const shape = try attn.Shape.init(@intCast(rows), at.heads, @intCast(stride));
+            const scales: u64 = if (at.kv8) |q| q.scales.ptr else 0;
+            const ropes: u64 = if (at.kv8) |q| q.ropes.ptr else 0;
             try mla.forward(k.project, k.attention, s, .{
                 .query = sc.q,
                 .key_weights = at.key,
@@ -522,7 +534,7 @@ pub const Model = struct {
                 .value_logits = sc.gate,
                 .positions = sc.positions.ptr,
                 .rotary_table = sc.table,
-                .kv = .{ .projection = sc.kv, .gain = at.kv_norm, .write_slots = if (at.sliding) sc.write_ring.ptr else sc.write_slots.ptr, .capacity = at.rows, .epsilon = eps },
+                .kv = .{ .projection = sc.kv, .gain = at.kv_norm, .write_slots = if (at.sliding) sc.write_ring.ptr else sc.write_slots.ptr, .capacity = at.rows, .epsilon = eps, .scales = scales, .ropes = ropes },
                 .attention = .{
                     .query = sc.absorb,
                     .cache = at.cache.ptr,
@@ -532,6 +544,8 @@ pub const Model = struct {
                     .scratch = sc.attn_scratch,
                     .scratch_bytes = sc.attn_scratch_bytes,
                     .output = sc.latent_out,
+                    .scales = scales,
+                    .ropes = ropes,
                 },
                 .values = sc.values,
             }, shape, if (at.sliding) try self.text.rotary(.sliding_attention) else rope_sparse);
@@ -613,6 +627,10 @@ fn inside(whole: []const f32, part: []const f32) bool {
         if (self.vision) |v| v.deinit();
         for (self.layers) |*layer| {
             layer.attention.cache.free();
+            if (layer.attention.kv8) |*q| {
+                q.scales.free();
+                q.ropes.free();
+            }
             if (layer.attention.index) |ix| {
                 ix.token_keys.free();
                 ix.group_keys.free();

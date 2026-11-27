@@ -8,6 +8,36 @@ struct Hy4RopeParameters { float frequencies[32]; uint32_t axes[32]; };
 struct Hy4RopeView { uint32_t rows, heads, input_stride, output_stride; };
 struct Hy4CacheWrite { uint32_t rows, capacity; float epsilon; };
 
+#include "../kv_fp8.cuh"
+
+// An indexed layer's E4M3 rows (`--kv-cache fp8`): the same normalization and BF16 row value tf_hy4_cache_keys writes,
+// quantized to one FP32 row scale (absmax / 448) and the format's saturated codes; the roped 64 columns go to a BF16
+// side plane, where a reader takes them instead of quantizing them.
+extern "C" __global__ void __launch_bounds__(512) tf_hy4_cache_keys_fp8(
+    const __nv_bfloat16 *input, const __nv_bfloat16 *gain, const __nv_bfloat16 *table, const int32_t *slots,
+    unsigned char *cache, float *scales, __nv_bfloat16 *ropes, Hy4CacheWrite a) {
+    const uint32_t row = blockIdx.x, t = threadIdx.x;
+    const int slot = slots[row];
+    if (slot < 0 || uint32_t(slot) >= a.capacity) return;
+    const __nv_bfloat16 *x = input + uint64_t(row) * 576;
+    const float v = __bfloat162float(x[t]);
+    __shared__ float partial[16];
+    const float inverse = rsqrtf(tf_common::block_sum_tree(__fmul_rn(v, v), partial, 16) / 512.0f + a.epsilon);
+    const float normalized = __bfloat162float(__float2bfloat16_rn(__fmul_rn(v, inverse)));
+    __shared__ float reduce[16];
+    tf_kv_fp8::quant_row<512, true>(__fmul_rn(normalized, __bfloat162float(gain[t])), t, cache + uint64_t(slot) * 512,
+                                    scales + slot, reduce);
+    if (t < 32) {
+        __nv_bfloat16 *y = ropes + uint64_t(slot) * 64;
+        const uint32_t col = 2 * t;
+        const float u = __bfloat162float(x[512 + col]), v1 = __bfloat162float(x[513 + col]);
+        const float c = __bfloat162float(table[uint64_t(row) * 64 + col]);
+        const float s = __bfloat162float(table[uint64_t(row) * 64 + col + 1]);
+        y[col] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(u, c), __fmul_rn(v1, s)));
+        y[col + 1] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(v1, c), __fmul_rn(u, s)));
+    }
+}
+
 // A request's write slots address distinct live rows in the retained latent arena.
 extern "C" __global__ void __launch_bounds__(128) tf_hy4_cache_keys(
     const __nv_bfloat16 *input, const __nv_bfloat16 *gain, const __nv_bfloat16 *table, const int32_t *slots,
