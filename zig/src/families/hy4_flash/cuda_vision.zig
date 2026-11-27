@@ -424,7 +424,10 @@ pub const Tower = struct {
             for (0..4) |t| {
                 const w = wts[p * 4 + t];
                 if (w == 0) continue;
-                const row = self.table[@as(usize, @intCast(taps[p * 4 + t])) * hidden ..][0..hidden];
+                // `vc.positions` indexes the 128 x 128 grid; the checkpoint's row 0 is the unused cls slot, so the
+                // grid's row `g` is the table's row `g + 1` (the reference embeds `arange(1, edge^2 + 1)`).
+                const g: usize = @intCast(taps[p * 4 + t]);
+                const row = self.table[(g + 1) * hidden ..][0..hidden];
                 for (&acc, row) |*v, x| v.* += w * readBf16(x);
             }
             for (o, acc) |*v, x| v.* = bf16(x);
