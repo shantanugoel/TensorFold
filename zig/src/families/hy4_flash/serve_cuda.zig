@@ -179,21 +179,31 @@ pub const Cuda = struct {
         self.seq[slot] = .{ .kept = true, .valid_from = from };
     }
 
-    /// A free slot for `s`, or NoFreeSlot: what it held stays, a kept prefix and the ring's high-water mark.
-    fn openSlot(self: *Cuda, s: *lanes.Stream) !usize {
-        for (self.seq[0..self.slots], 0..) |*q, i| {
+    /// A free slot for `s`, or NoFreeSlot: what it held stays, a kept prefix and the ring's high-water mark. The slot whose
+    /// kept history shares the longest prefix with the prompt is the one a fill resumes on, so a multi-turn request lands
+    /// where it left off rather than on an empty slot (an empty slot shares nothing, and the first free one is taken).
+    fn openSlot(self: *Cuda, s: *lanes.Stream, ids: []const u32) !usize {
+        var best: ?usize = null;
+        var most: usize = 0;
+        for (self.seq[0..self.slots], 0..) |q, i| {
             if (q.stream != null) continue;
-            const kept = q.kept;
-            const from = q.valid_from;
-            q.* = .{ .stream = s, .kept = kept, .valid_from = from };
-            return i;
+            const same = if (q.kept) sharedPrefix(self.m.tokens(i), ids) else 0;
+            if (best == null or same > most) {
+                best = i;
+                most = same;
+            }
         }
-        return error.NoFreeSlot;
+        const i = best orelse return error.NoFreeSlot;
+        const q = &self.seq[i];
+        const kept = q.kept;
+        const from = q.valid_from;
+        q.* = .{ .stream = s, .kept = kept, .valid_from = from };
+        return i;
     }
 
     /// A free slot for `s`, and the row its fill starts at: the kept prefix its caches still hold.
     fn openFill(self: *Cuda, s: *lanes.Stream, ids: []const u32) !usize {
-        const i = try self.openSlot(s);
+        const i = try self.openSlot(s, ids);
         const q = &self.seq[i];
         q.from = self.reuseFrom(i, ids);
         s.cached = @intCast(q.from);
@@ -463,10 +473,7 @@ pub const Cuda = struct {
     pub fn reuseFrom(self: *Cuda, slot: usize, ids: []const u32) usize {
         var from: usize = 0;
         if (self.seq[slot].kept and ids.len > 0) {
-            const hist = self.m.tokens(slot);
-            var same: usize = 0;
-            const most = @min(hist.len, ids.len - 1);
-            while (same < most and hist[same] == ids[same]) same += 1;
+            const same = sharedPrefix(self.m.tokens(slot), ids);
             if (same >= keep_prefix and self.mayRewind(slot, @intCast(same))) from = same;
             self.seq[slot].kept = false;
         }
@@ -521,6 +528,16 @@ pub const Cuda = struct {
         self.seq[slot] = .{ .kept = true, .valid_from = self.seq[slot].valid_from };
     }
 };
+
+/// The rows two histories share from row 0, as a fill's resume reads them: a prompt resumes at its kept prefix. The
+/// prompt's last row is never a resume, so a history that contains the whole prompt shares one row less.
+fn sharedPrefix(hist: []const u32, ids: []const u32) usize {
+    if (ids.len == 0) return 0;
+    const most = @min(hist.len, ids.len - 1);
+    var same: usize = 0;
+    while (same < most and hist[same] == ids[same]) same += 1;
+    return same;
+}
 
 /// A FP32 logit as the bf16 word a bf16 head would write (round to nearest even, NaN kept).
 fn roundBf16(v: f32) u16 {
@@ -655,6 +672,40 @@ test "a slot belongs to a stream only while the history it filled is that stream
     try std.testing.expect(!c.owns(1, &.{ 1, 2 }));
     c.reclaim(1);
     try std.testing.expect(c.seq[1].stream == null and c.seq[1].kept);
+}
+
+test "a free slot is chosen by the kept history it shares, so a multi-turn prompt lands where it left off" {
+    var first: [512]u32 = undefined;
+    var second: [512]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast(i % 97 + 1);
+    for (&second, 0..) |*t, i| t.* = @intCast(i % 89 + 1);
+    const hists = try std.testing.allocator.alloc(std.ArrayList(u32), 3);
+    defer std.testing.allocator.free(hists);
+    hists[0] = .{ .items = first[0..100], .capacity = first.len, .pointer_stability = .{} };
+    hists[1] = .{ .items = first[0..300], .capacity = first.len, .pointer_stability = .{} };
+    hists[2] = .{ .items = second[0..0], .capacity = second.len, .pointer_stability = .{} };
+    var m: model.Model = undefined;
+    m.capacity = 262_144;
+    m.slots = 3;
+    m.history = hists;
+    var s: lanes.Stream = undefined;
+    var c: Cuda = undefined;
+    c.m = &m;
+    c.slots = 3;
+    c.seq = @splat(Seq{});
+    c.seq[2] = .{ .stream = &s }; // a busy slot: never chosen
+    var prompt: [400]u32 = undefined;
+    @memcpy(prompt[0..400], first[0..400]);
+    // Both kept slots share the prompt's first 100 rows; the longer shared prefix is the one to resume on.
+    c.seq[0] = .{ .kept = true };
+    c.seq[1] = .{ .kept = true };
+    try std.testing.expectEqual(@as(usize, 1), try c.openSlot(&s, &prompt));
+    // Only the shorter one is free: it still beats an empty slot (which shares nothing).
+    c.seq[1] = .{ .stream = &s };
+    try std.testing.expectEqual(@as(usize, 0), try c.openSlot(&s, &prompt));
+    // No free slot at all.
+    c.seq[0] = .{ .stream = &s };
+    try std.testing.expectError(error.NoFreeSlot, c.openSlot(&s, &prompt));
 }
 
 test "a rewind is allowed exactly while the ring still holds the rows its first window reads" {
