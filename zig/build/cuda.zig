@@ -161,6 +161,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     @import("hy4_cuda.zig").install(b, target, optimize, cuda, mods.core);
     @import("hy4_cuda.zig").installReuse(b, target, optimize, cuda, mods.core, mods.lanes);
     @import("hy4_cuda.zig").installDraft(b, target, optimize, cuda, mods.core, mods.lanes);
+    @import("hy4_cuda.zig").installLanes(b, target, optimize, cuda, mods.core, mods.lanes);
     const server_exe = nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision, mods.tokenizer, mods.living, build_options, true, strip);
     b.step("compile-config-server", "Compile the actual CUDA server config entry point without installing or running").dependOn(&server_exe.step);
     // tf-qwen35-cuda: the Qwen CUDA forward's rows for a reference to compare, and its tower on picture files

@@ -63,3 +63,21 @@ pub fn installReuse(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     const exe = b.addExecutable(.{ .name = "tf-hy4-cuda-reuse", .root_module = root });
     b.step("hy4-cuda-reuse", "Build the Hy4-flash prefix-reuse check that needs a device").dependOn(&b.addInstallArtifact(exe, .{}).step);
 }
+
+/// `tf-hy4-cuda-lanes`: the batching review's isolation checks on a device (a neighbour sequence's bytes, recall lists
+/// per sequence, a resumed fill against a cold one, and a window that runs past the caches).
+pub fn installLanes(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) void {
+    const root = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/hy4_flash/lanes_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    root.addImport("lanes", lanes);
+    root.addImport("cuda", cuda);
+    root.addImport("core", core);
+    root.addImport("engram_hash_core", b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/engram_hash.zig"), .target = target, .optimize = optimize }));
+    root.addImport("config_number", b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/config_number.zig"), .target = target, .optimize = optimize }));
+    const exe = b.addExecutable(.{ .name = "tf-hy4-cuda-lanes", .root_module = root });
+    b.step("hy4-cuda-lanes", "Build the Hy4-flash multi-sequence isolation checks that need a device").dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
