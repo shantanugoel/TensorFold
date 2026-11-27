@@ -52,6 +52,12 @@ pub fn serveCap(capacity: usize, rounds: u32) usize {
     return if (capacity > @as(usize, rounds)) capacity - @as(usize, rounds) else capacity;
 }
 
+/// Whether a context can be split into sequences: the indexer pools four slots a group and a recall list ranks whole
+/// groups, so past one sequence the cache must close on a group (the server rounds its context to 512 anyway).
+pub fn capacityFits(capacity: usize, slots: usize) bool {
+    return slots <= 1 or capacity % @import("index_groups.zig").slots == 0;
+}
+
 /// Per-token bytes the caches take at this capacity over every sequence: the KV, the indexer's keys and the scores.
 pub fn bytesPerToken(m: *const model.Model) u64 {
     const b = cacheBytes(m);
@@ -103,6 +109,8 @@ pub const Cuda = struct {
 
     /// Loads the pack: `slots` sequences' caches of `capacity` positions, `prompt_rows` rows a pass, `drafts` a round.
     pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize) !*Cuda {
+        // A sequence's cache must close on the indexer's four-slot group, or its pooled keys and recall lists overlap.
+        if (!capacityFits(capacity, slots)) return error.Hy4UngroupedCapacity;
         const self = try a.create(Cuda);
         errdefer a.destroy(self);
         const m = try model.Model.open(a, io, d, s, k, dir, .{ .capacity = capacity, .max_rows = prompt_rows, .drafts = rounds, .slots = slots });
@@ -512,6 +520,15 @@ test "a draft block prices as a fixed charge and a slope per draft" {
     try std.testing.expectEqual(@as(f64, 9.46), one.fixed);
     const odd = Cuda.blockPrice(12, 11, 5);
     try std.testing.expectEqual(@as(f64, 12), odd.fixed);
+}
+
+test "a context split between sequences closes on the indexer's four-slot group" {
+    // One sequence ranks its own slots, so any context it can hold is addressable.
+    try std.testing.expect(capacityFits(4097, 1));
+    try std.testing.expect(capacityFits(262_144, 8));
+    // Several sequences pool groups inside each one's arena: a context short of a group leaves a half group at its end.
+    try std.testing.expect(!capacityFits(4097, 2));
+    try std.testing.expect(!capacityFits(262_142, 4));
 }
 
 test "a request fills the caches less the room a round's window writes past its last token" {
