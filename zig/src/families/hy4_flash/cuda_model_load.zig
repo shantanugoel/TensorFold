@@ -164,7 +164,9 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         ck.release();
         const tower = self.vision.?;
         std.debug.print("image tower: {d} layers, {d:.2} GiB of weights and {d:.0} MiB of its own scratch for {d} patches an image\n", .{ tower.layers.len, @as(f64, @floatFromInt(tower.bytes)) / (1 << 30), @as(f64, @floatFromInt(tower.scratch_bytes)) / (1 << 20), tower.patches_max });
-        self.weight_bytes = self.own.bytes;
+        // The tower's weights are what it added to the uploader; the pass scratch and the dense reserve after
+        // `weight_bytes`'s first read are not weights, so the line means the same thing with --vision on and off.
+        self.weight_bytes += tower.bytes;
     }
     // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor
     try @import("loader.zig").finishCuda(ck, cfg.value, self.draft != null, o.vision);
