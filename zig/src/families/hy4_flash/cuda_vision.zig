@@ -29,7 +29,7 @@ pub const merge_width = hidden * merge * merge;
 /// Rows the token-wise GEMMs run at once, so their block is bounded by this and not by the patch count.
 const block_rows: usize = 2048;
 /// The processor's limits: LM tokens an image may take (the patch budget's ceiling, `(gh / 2) * (gw / 2 + 1)`), and
-/// the images a request may hold.
+/// the images a request may hold — the pack's own ceiling, which `--vision-max-images` lowers and cannot raise.
 const limits: vc.Limits = .{};
 pub const token_limit: u32 = limits.image_tokens;
 pub const image_limit: u32 = limits.max_images;

@@ -156,7 +156,7 @@ pub const Cuda = struct {
     pub const default_image_tokens: u32 = cuda_vision.token_limit;
 
     /// Loads the pack: `slots` sequences' caches of `capacity` positions, `prompt_rows` rows a pass, `drafts` a round.
-    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize, vision_tokens: u32, kv8: bool) !*Cuda {
+    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize, vision_tokens: u32, vision_images: u32, kv8: bool) !*Cuda {
         // A sequence's cache must close on the indexer's four-slot group, or its pooled keys and recall lists overlap.
         if (!capacityFits(capacity, slots)) return error.Hy4UngroupedCapacity;
         if (vision_tokens > cuda_vision.token_limit) return error.BadHy4VisionLimits;
@@ -191,7 +191,8 @@ pub const Cuda = struct {
             self.vision = .{
                 .io = io,
                 .cfg = cfg,
-                .limits = .{ .image_tokens = vision_tokens, .max_images = cuda_vision.image_limit },
+                // `--vision-max-images` is the cap the server enforces, up to the pack's own image count.
+                .limits = .{ .image_tokens = vision_tokens, .max_images = @min(vision_images, cuda_vision.image_limit) },
                 .marks = .{ .open = cfg.image_start, .image = cfg.image_token, .close = cfg.image_end },
                 .mark_ids = .{ cfg.image_start, cfg.image_token, cfg.image_end },
             };

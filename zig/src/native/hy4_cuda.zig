@@ -92,6 +92,11 @@ fn imageTokens(v: api.VisionOpen) u32 {
     return if (v.image_tokens_set) v.image_tokens else family.Cuda.default_image_tokens;
 }
 
+/// The images a request may hold: `--vision-max-images` (default 4), which the engine caps at the pack's own count.
+fn maxImages(v: api.VisionOpen) u32 {
+    return v.max_images;
+}
+
 fn put(out: []u8, message: []const u8) []const u8 {
     const n = @min(message.len, out.len);
     @memcpy(out[0..n], message[0..n]);
@@ -186,7 +191,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const drafts = loadDrafts(o.lanes, draft_lanes, asked);
     if (asked > 0 and drafts == 0) std.log.info("hy4-cuda: --mtp-drafts {d} not loaded: a --parallel {d} server serves the plain path (a resident tower costs a shared pass about 10 %, step 6c; use --parallel 1, or TF_HY4_DRAFT_LANES=3 to draft in a two-lane round)", .{ asked, o.lanes });
     const vision_tokens: u32 = if (o.vision) |v| imageTokens(v) else 0;
-    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes, vision_tokens, o.kv8) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
+    const vision_images: u32 = if (o.vision) |v| maxImages(v) else 0;
+    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes, vision_tokens, vision_images, o.kv8) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
     const bytes = h.c.bytes();
