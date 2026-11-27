@@ -230,7 +230,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         .startup = h.startup,
     });
     // --vision: the tower's processor behind the server's image expansion (it writes the prompt's placeholders).
-    if (o.vision != null) h.host.info_.vision = @import("cuda_vision_offer.zig").offer(&h.c.vision, o.vision);
+    if (o.vision != null) h.host.info_.vision = @import("cuda_vision_offer.zig").offer(@as(?*family.Vision, &h.c.vision), o.vision);
     h.host.on_thread = .{ .ctx = h, .run = bindThread };
     h.host.health = .{ .ctx = h, .read = healthy };
     h.host.memory = .{ .ctx = null, .read = memory };

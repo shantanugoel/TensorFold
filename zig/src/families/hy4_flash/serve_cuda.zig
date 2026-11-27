@@ -100,8 +100,9 @@ pub const Vision = struct {
     marks: struct { open: u32, image: u32, close: u32 },
     mark_ids: [3]u32,
 
-    pub fn prepare(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) anyerror!@import("engine_api").PreparedImage {
-        const v: *Vision = @ptrCast(@alignCast(ctx));
+    /// The checkpoint's processor behind the server's image expansion: `max_tokens` an image may take, capped by the
+    /// `--vision-image-tokens` the tower's scratch was sized for.
+    pub fn prepare(v: *const Vision, a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) anyerror!@import("engine_api").PreparedImage {
         const p = try cuda_vision.vc.prepare(v.io, a, bytes, v.cfg, @min(max_tokens, v.limits.image_tokens));
         return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
     }

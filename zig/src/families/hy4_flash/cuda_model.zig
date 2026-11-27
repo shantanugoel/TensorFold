@@ -227,7 +227,7 @@ pub const Model = struct {
             var p = plan;
             p.deinit();
         }
-        const rows = try cuda.DeviceBuffer.alloc(self.d, @max(plan.rows, 1) * H * 2);
+        var rows = try cuda.DeviceBuffer.alloc(self.d, @max(plan.rows, 1) * H * 2);
         errdefer rows.free();
         const groups = try self.a.alloc(i32, cuda_index.groups_of(self.capacity) * 3);
         @memset(groups, 0);
