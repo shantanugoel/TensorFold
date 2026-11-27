@@ -136,6 +136,13 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     self.engrams = engrams;
     // DFly2's tower: the pack's `model.dfly_layers.*`, on the device only when a round holds drafts.
     if (o.drafts > 0) {
+        // The tower binds each layer to a target layer's cache and recall list. `config.zig` reads that off the
+        // pack's layer types; this checks the layers the load actually built, so a ring on one of the five is caught.
+        for (cfg.value.dfly_target_kv_layers, cfg.value.dfly_target_index_layer) |kv, ix| {
+            if (kv >= self.layers.len or ix >= self.layers.len) return error.BadDraftGeometry;
+            const att = self.layers[kv].attention;
+            if (att.sliding or att.index == null or self.layers[ix].attention.index == null) return error.BadDraftGeometry;
+        }
         self.draft = try dfly.load(a, &self.own, d, ck, cfg.value, self.slots);
         ck.release();
         const dr = self.draft.?;

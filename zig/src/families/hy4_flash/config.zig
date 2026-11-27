@@ -180,8 +180,10 @@ pub const Model = struct {
             self.dfly_target_index_topk != t.compressed_indexer_candidate_topk or self.dfly_mask_token_id >= t.vocab_size)
             return error.BadDraftGeometry;
         for (self.dfly_target_index_layer, self.dfly_target_kv_layers) |index, kv| {
+            // Both layers the tower reads must be indexed (full-context) ones: a sliding layer's cache holds a
+            // window, not the positions a draft row's recall list names.
             if (index >= t.num_hidden_layers or kv >= t.num_hidden_layers or
-                t.layer_types[index] != .deepseek_sparse_attention) return error.BadDraftGeometry;
+                t.layer_types[index] != .deepseek_sparse_attention or t.layer_types[kv] != .deepseek_sparse_attention) return error.BadDraftGeometry;
         }
     }
 };

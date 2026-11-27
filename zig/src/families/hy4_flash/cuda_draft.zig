@@ -98,41 +98,42 @@ pub const Kernels = struct {
     }
 };
 
-/// A proposal's inputs and outputs, and the block's scratch, sized once at load.
+/// A proposal's inputs and outputs, and the block's scratch, sized once at load: every buffer owned here, so one
+/// `freeBuffers` releases all of it (a bare address would leak the allocation it came from).
 pub const Scratch = struct {
     streams: [2]cuda.DeviceBuffer, // the block's residual, BF16 [width, hidden], rotated
-    normed: u64, // BF16 [width, hidden]: a layer's input norm, and the block's final-normed rows
-    norm_resid: u64, // BF16 [width, hidden]: what a norm-only call leaves as its residual (never read)
-    q_raw: u64, // BF16 [width, q_lora_rank]
-    q_tmp: u64,
-    q_resid: u64,
-    q: u64, // BF16 [width, heads, 256]
-    kv: u64, // BF16 [width, 512 + 64]
-    gate: u64, // BF16 [width, heads, value_width]
-    absorb: u64, // BF16 [width, heads, 512 + 64]
-    latent_out: u64,
-    values: u64, // BF16 [width, heads, value_width]
-    branch: u64, // BF16 [width, hidden]: a layer's attention or feed-forward output
-    attn_scratch: u64,
+    normed: cuda.DeviceBuffer, // BF16 [width, hidden]: a layer's input norm, and the block's final-normed rows
+    norm_resid: cuda.DeviceBuffer, // BF16 [width, hidden]: what a norm-only call leaves as its residual (never read)
+    q_raw: cuda.DeviceBuffer, // BF16 [width, q_lora_rank]
+    q_tmp: cuda.DeviceBuffer,
+    q_resid: cuda.DeviceBuffer,
+    q: cuda.DeviceBuffer, // BF16 [width, heads, 256]
+    kv: cuda.DeviceBuffer, // BF16 [width, 512 + 64]
+    gate: cuda.DeviceBuffer, // BF16 [width, heads, value_width]
+    absorb: cuda.DeviceBuffer, // BF16 [width, heads, 512 + 64]
+    latent_out: cuda.DeviceBuffer,
+    values: cuda.DeviceBuffer, // BF16 [width, heads, value_width]
+    branch: cuda.DeviceBuffer, // BF16 [width, hidden]: a layer's attention or feed-forward output
+    attn_scratch: cuda.DeviceBuffer,
     attn_bytes: usize,
     positions: cuda.DeviceBuffer, // i32 [width, 3]
-    table: u64, // BF16 [width, 32, 2]
+    table: cuda.DeviceBuffer, // BF16 [width, 32, 2]
     write_slots: cuda.DeviceBuffer, // u32 [width]: the anchor's positions, which the verification rewrites
     slots: cuda.DeviceBuffer, // u32 [layers, width, key_stride]: each row's own attended set, a list a layer
     counts: cuda.DeviceBuffer, // u32 [layers, width]
-    ff_gate: u64, // BF16 [width, inner]
-    ff_up: u64,
-    ff_inner: u64,
-    down: u64, // BF16 [width, hidden]
-    fused: u64, // BF16 [hidden]: mtp_fusion's projection, before the gate
-    cat: u64, // BF16 [2, hidden]: [normed row, normed token] read as one 2 * hidden row
-    c_gate: u64, // BF16 [hidden]
-    c_up: u64,
-    c_act: u64,
-    c_down: u64,
-    corrected: u64, // BF16 [hidden]
+    ff_gate: cuda.DeviceBuffer, // BF16 [width, inner]
+    ff_up: cuda.DeviceBuffer,
+    ff_inner: cuda.DeviceBuffer,
+    down: cuda.DeviceBuffer, // BF16 [width, hidden]
+    fused: cuda.DeviceBuffer, // BF16 [hidden]: mtp_fusion's projection, before the gate
+    cat: cuda.DeviceBuffer, // BF16 [2, hidden]: [normed row, normed token] read as one 2 * hidden row
+    c_gate: cuda.DeviceBuffer, // BF16 [hidden]
+    c_up: cuda.DeviceBuffer,
+    c_act: cuda.DeviceBuffer,
+    c_down: cuda.DeviceBuffer,
+    corrected: cuda.DeviceBuffer, // BF16 [hidden]
     previous: cuda.DeviceBuffer, // BF16 [hidden]: the token the next slot's correction reads
-    logits: u64, // F32 [vocab]
+    logits: cuda.DeviceBuffer, // F32 [vocab]
     ids: cuda.DeviceBuffer, // i32 [1]
     /// The five target layers' lists as the passes wrote them: a layer's five sequences', one after another.
     lists: []cuda.DeviceBuffer,
@@ -148,7 +149,8 @@ pub const Seq = struct {
     /// The pass row whose lists a proposal reads: a window's first, or a prompt chunk's last.
     cap_at: usize = 0,
     keep: usize = 1, // rows captured from `cap_at`
-    /// The head's own row of `cap_at`, which the fusion's target carry is read from.
+    /// The head's own row of `cap_at`, which the fusion's target carry is read from: the head keeps a row at a time
+    /// on the one-row path, so the pass's last row is head row 0 there, and row `r` only where the pass kept every row.
     anchor: usize = 0,
     /// The head's row of the last window's first row: a kept window row `r` sits at `head0 + r`.
     head0: usize = 0,
@@ -203,8 +205,47 @@ fn alloc(d: *const cuda.Driver, len: usize) !cuda.DeviceBuffer {
     return b;
 }
 
-fn zeros(d: *const cuda.Driver, len: usize) !u64 {
-    return (try alloc(d, len)).ptr;
+/// A block's buffer, zeroed: the scratch a proposal reads before it writes is defined, not whatever was there.
+fn zeros(d: *const cuda.Driver, len: usize) !cuda.DeviceBuffer {
+    return alloc(d, len);
+}
+
+/// A buffer that owns nothing: a scratch's field before its allocation, so freeing a partly built scratch is safe.
+const none: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 };
+
+/// A scratch with no buffer allocated: every field at its empty value, whatever it holds.
+fn noBuffers() Scratch {
+    var sc: Scratch = undefined;
+    const info = @typeInfo(Scratch).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        const empty: T = switch (T) {
+            cuda.DeviceBuffer => none,
+            [2]cuda.DeviceBuffer => .{ none, none },
+            []cuda.DeviceBuffer, []Seq => &.{},
+            usize => 0,
+            else => @compileError("a new scratch field needs an empty value: " ++ name),
+        };
+        @field(sc, name) = empty;
+    }
+    return sc;
+}
+
+/// Every buffer this scratch owns, released once: a partly built scratch's empty fields are skipped.
+fn freeBuffers(sc: *Scratch) void {
+    const info = @typeInfo(Scratch).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (T != cuda.DeviceBuffer) continue;
+        var b = @field(sc, name);
+        if (b.len > 0) b.free();
+        @field(sc, name) = none;
+    }
+    for (&sc.streams) |*b| if (b.len > 0) b.free();
+    for (sc.lists, sc.captured) |list, count| {
+        var l = list;
+        if (l.len > 0) l.free();
+        var c = count;
+        if (c.len > 0) c.free();
+    }
 }
 
 /// A BF16 tensor of the pack, exactly as `checkDraft` (weights.zig) has already admitted it.
@@ -276,7 +317,8 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
             .mlp_down = try take(own, ck, p ++ "{d}.mlp.down_proj.weight", .{i}, &.{ H, inner }),
         };
     }
-    var sc: Scratch = undefined;
+    var sc: Scratch = noBuffers();
+    errdefer freeBuffers(&sc);
     for (&sc.streams) |*b| b.* = try alloc(d, width * H * 2);
     sc.normed = try zeros(d, width * H * 2);
     sc.norm_resid = try zeros(d, width * H * 2);
@@ -314,8 +356,10 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
     sc.ids = try alloc(d, 4);
     sc.lists = try a.alloc(cuda.DeviceBuffer, layers * slots);
     errdefer a.free(sc.lists);
+    @memset(sc.lists, none);
     sc.captured = try a.alloc(cuda.DeviceBuffer, layers * slots);
     errdefer a.free(sc.captured);
+    @memset(sc.captured, none);
     for (sc.lists) |*b| b.* = try alloc(d, width * geom.sparse_stride * 4);
     for (sc.captured) |*b| b.* = try alloc(d, width * 4);
     sc.seq = try a.alloc(Seq, slots);
@@ -329,6 +373,12 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
     errdefer a.free(host_lists);
     const host_captured = try a.alloc(u32, layers);
     errdefer a.free(host_captured);
+    // Every tensor field below is the last thing that may fail: the weights and the scratch are already on the device.
+    const kernels = try Kernels.load(d);
+    errdefer {
+        var k = kernels;
+        k.deinit();
+    }
     return .{
         .layers = layer_weights,
         .inner = inner,
@@ -346,7 +396,7 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
         .mask = cfg.dfly_mask_token_id,
         .rope = try t.rotary(.deepseek_sparse_attention),
         .scratch = sc,
-        .kernels = try Kernels.load(d),
+        .kernels = kernels,
         .host_keys = host_keys,
         .host_counts = host_counts,
         .host_captured = host_captured,
@@ -355,17 +405,8 @@ pub fn load(a: std.mem.Allocator, own: *cuda.exl3_upload.Uploader, d: *const cud
 }
 
 pub fn free(a: std.mem.Allocator, d: *Draft) void {
-    const sc = d.scratch;
-    for ([_]cuda.DeviceBuffer{ sc.streams[0], sc.streams[1], sc.positions, sc.write_slots, sc.slots, sc.counts, sc.ids, sc.previous }) |b| {
-        var buf = b;
-        buf.free();
-    }
-    for (sc.lists, sc.captured) |list, count| {
-        var l = list;
-        l.free();
-        var c = count;
-        c.free();
-    }
+    var sc = d.scratch;
+    freeBuffers(&sc);
     a.free(sc.lists);
     a.free(sc.captured);
     a.free(sc.seq);
@@ -377,13 +418,22 @@ pub fn free(a: std.mem.Allocator, d: *Draft) void {
     a.free(d.layers);
 }
 
-/// The head row a proposal reads the target's hidden state and recalled lists from: the last row the target kept.
-pub fn source(d: *const Draft, slot: usize, kept: ?usize) usize {
-    return if (kept) |k| d.scratch.seq[slot].head0 + k else d.scratch.seq[slot].anchor;
+/// Where a proposal reads the target's state from: two indices, because they are not the same row.
+pub const Source = struct {
+    /// The head's row of the target's post-final-norm hidden state (`head_norm`): the last row the target kept.
+    head: usize,
+    /// The captured recall list's row: 0 is the row the pass captured first, so a window's kept row is its own.
+    list: usize,
+};
+
+/// The rows a proposal reads the target's hidden state and recalled lists from.
+pub fn source(d: *const Draft, slot: usize, kept: ?usize) Source {
+    const q = d.scratch.seq[slot];
+    return if (kept) |k| .{ .head = q.head0 + k, .list = k } else .{ .head = q.anchor, .list = 0 };
 }
 
 /// `depth` proposals after `anchor`; the block's own rows go into the target's caches at `anchor .. anchor + width`.
-pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, depth: u32, row: usize, held: []u32) !void {
+pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, depth: u32, from: Source, held: []u32) !void {
     const s = mm.s;
     const k = mm.k;
     const sc = &d.scratch;
@@ -404,7 +454,7 @@ pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, de
     try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(&positions), s.handle);
     try sc.write_slots.uploadAsync(0, std.mem.sliceAsBytes(&writes), s.handle);
     // Each layer's rows attend the target list its own target layer kept for the source row, plus its own prefix.
-    try buildKeys(mm, d, slot, anchor, row);
+    try buildKeys(mm, d, slot, anchor, from.list);
     try sc.slots.uploadAsync(0, std.mem.sliceAsBytes(d.host_keys), s.handle);
     try sc.counts.uploadAsync(0, std.mem.sliceAsBytes(d.host_counts), s.handle);
     // The block's embeddings: the anchor's row, then five mask rows.
@@ -413,86 +463,86 @@ pub fn propose(mm: *Model, d: *Draft, slot: usize, anchor: usize, bonus: u32, de
         try sc.streams[0].copyFrom(i * H * 2, mm.embed + @as(u64, token) * H * 2, H * 2, s.handle);
     }
     // mtp_fusion on slot 0: the gate's share of eh_proj over [normed anchor, normed target hidden].
-    const target_hidden = mm.scratch.head_norm + row * H * 2;
+    const target_hidden = mm.scratch.head_norm + from.head * H * 2;
     // The target's own norm form (`addRmsTail`'s tail, BF16 weights): `norms.rms` reads a BF16 row as f32.
-    try k.norms.addRmsTail(s, sc.streams[0].ptr, null, d.enorm, sc.norm_resid, sc.cat, null, 1, H, eps, .{ .round = true });
-    try k.norms.addRmsTail(s, target_hidden, null, d.hnorm, sc.norm_resid, sc.cat + H * 2, null, 1, H, eps, .{ .round = true });
-    try k.gemm.run(s, sc.cat, d.eh, sc.fused, 1, H, 2 * H, .bf16);
+    try k.norms.addRmsTail(s, sc.streams[0].ptr, null, d.enorm, sc.norm_resid.ptr, sc.cat.ptr, null, 1, H, eps, .{ .round = true });
+    try k.norms.addRmsTail(s, target_hidden, null, d.hnorm, sc.norm_resid.ptr, sc.cat.ptr + H * 2, null, 1, H, eps, .{ .round = true });
+    try k.gemm.run(s, sc.cat.ptr, d.eh, sc.fused.ptr, 1, H, 2 * H, .bf16);
     if (d.trail) |t| {
-        try t.cat.copyFrom(0, sc.cat, 2 * H * 2, s.handle);
-        try t.proj.copyFrom(0, sc.fused, H * 2, s.handle);
+        try t.cat.copyFrom(0, sc.cat.ptr, 2 * H * 2, s.handle);
+        try t.proj.copyFrom(0, sc.fused.ptr, H * 2, s.handle);
     }
-    try d.kernels.fuseRow(s, sc.streams[0].ptr, sc.fused, d.fuse_gate, sc.streams[0].ptr, H);
+    try d.kernels.fuseRow(s, sc.streams[0].ptr, sc.fused.ptr, d.fuse_gate, sc.streams[0].ptr, H);
     if (d.trail) |t| try t.fused.copyFrom(0, sc.streams[0].ptr, H * 2, s.handle);
-    if (d.trail) |t| try t.carry.copyFrom(0, mm.scratch.head_norm + row * H * 2, H * 2, s.handle);
+    if (d.trail) |t| try t.carry.copyFrom(0, mm.scratch.head_norm + from.head * H * 2, H * 2, s.handle);
     // The five layers: each writes its own K/V into the target's cache and reads the target's list.
     const shape = try attn.Shape.init(width, d.heads, key_stride);
     const res = sc.streams[0].ptr;
     const spare = sc.streams[1].ptr;
-    try k.norms.addRmsTail(s, res, null, d.layers[0].input_norm, sc.norm_resid, sc.normed, null, width, H, eps, .{ .round = true });
+    try k.norms.addRmsTail(s, res, null, d.layers[0].input_norm, sc.norm_resid.ptr, sc.normed.ptr, null, width, H, eps, .{ .round = true });
     for (d.layers, 0..) |*l, i| {
         const target = &mm.layers[l.target_kv].attention;
         const slots = sc.slots.ptr + @as(u64, i) * width * key_stride * 4;
         const counts = sc.counts.ptr + @as(u64, i) * width * 4;
-        try k.gemm.run(s, sc.normed, l.q_a, sc.q_raw, width, Q, H, .bf16);
-        try k.norms.addRmsTail(s, sc.q_raw, null, l.q_norm, sc.q_tmp, sc.q_resid, null, width, Q, eps, .{ .round = true });
-        try k.gemm.run(s, sc.q_resid, l.q_b, sc.q, width, hh * m.query_stride, Q, .bf16);
-        try k.gemm.run(s, sc.normed, l.kv_a, sc.kv, width, m.absorbed_stride, H, .bf16);
-        try k.gemm.run(s, sc.normed, l.gate, sc.gate, width, channels, H, .bf16);
+        try k.gemm.run(s, sc.normed.ptr, l.q_a, sc.q_raw.ptr, width, Q, H, .bf16);
+        try k.norms.addRmsTail(s, sc.q_raw.ptr, null, l.q_norm, sc.q_tmp.ptr, sc.q_resid.ptr, null, width, Q, eps, .{ .round = true });
+        try k.gemm.run(s, sc.q_resid.ptr, l.q_b, sc.q.ptr, width, hh * m.query_stride, Q, .bf16);
+        try k.gemm.run(s, sc.normed.ptr, l.kv_a, sc.kv.ptr, width, m.absorbed_stride, H, .bf16);
+        try k.gemm.run(s, sc.normed.ptr, l.gate, sc.gate.ptr, width, channels, H, .bf16);
         try mla.forward(k.project, k.attention, s, .{
-            .query = sc.q,
+            .query = sc.q.ptr,
             .key_weights = l.key,
             .value_weights = l.value,
-            .value_logits = sc.gate,
+            .value_logits = sc.gate.ptr,
             .positions = sc.positions.ptr,
-            .rotary_table = sc.table,
-            .kv = .{ .projection = sc.kv, .gain = l.kv_norm, .write_slots = sc.write_slots.ptr, .capacity = target.rows, .epsilon = eps },
+            .rotary_table = sc.table.ptr,
+            .kv = .{ .projection = sc.kv.ptr, .gain = l.kv_norm, .write_slots = sc.write_slots.ptr, .capacity = target.rows, .epsilon = eps },
             .attention = .{
-                .query = sc.absorb,
+                .query = sc.absorb.ptr,
                 .cache = target.cache.ptr,
                 .slots = slots,
                 .counts = counts,
                 .sinks = l.sinks,
-                .scratch = sc.attn_scratch,
+                .scratch = sc.attn_scratch.ptr,
                 .scratch_bytes = sc.attn_bytes,
-                .output = sc.latent_out,
+                .output = sc.latent_out.ptr,
             },
-            .values = sc.values,
+            .values = sc.values.ptr,
         }, shape, d.rope);
-        try k.gemm.run(s, sc.values, l.output, sc.branch, width, H, channels, .bf16);
+        try k.gemm.run(s, sc.values.ptr, l.output, sc.branch.ptr, width, H, channels, .bf16);
         // The sandwich norm on the attention output, the residual, then the feed-forward's input norm.
-        try k.norms.addRmsTail(s, sc.branch, res, l.post_norm, spare, sc.normed, null, width, H, eps, .{ .round = true, .branch = l.output_norm });
-        try k.gemm.run(s, sc.normed, l.mlp_gate, sc.ff_gate, width, d.inner, H, .bf16);
-        try k.gemm.run(s, sc.normed, l.mlp_up, sc.ff_up, width, d.inner, H, .bf16);
-        try k.act.swiglu(s, sc.ff_gate, d.inner, sc.ff_up, d.inner, sc.ff_inner, null, width, d.inner);
-        try k.gemm.run(s, sc.ff_inner, l.mlp_down, sc.down, width, H, d.inner, .bf16);
+        try k.norms.addRmsTail(s, sc.branch.ptr, res, l.post_norm, spare, sc.normed.ptr, null, width, H, eps, .{ .round = true, .branch = l.output_norm });
+        try k.gemm.run(s, sc.normed.ptr, l.mlp_gate, sc.ff_gate.ptr, width, d.inner, H, .bf16);
+        try k.gemm.run(s, sc.normed.ptr, l.mlp_up, sc.ff_up.ptr, width, d.inner, H, .bf16);
+        try k.act.swiglu(s, sc.ff_gate.ptr, d.inner, sc.ff_up.ptr, d.inner, sc.ff_inner.ptr, null, width, d.inner);
+        try k.gemm.run(s, sc.ff_inner.ptr, l.mlp_down, sc.down.ptr, width, H, d.inner, .bf16);
         // The residual, and the next layer's input norm (the block's final norm after the fifth).
         const next_norm = if (i + 1 < d.layers.len) d.layers[i + 1].input_norm else d.final_norm;
         // Writes the layer's whole output back into `res`; `spare` is free scratch again for the next attention add.
-        try k.norms.addRmsTail(s, sc.down, spare, next_norm, res, sc.normed, null, width, H, eps, .{ .round = true });
+        try k.norms.addRmsTail(s, sc.down.ptr, spare, next_norm, res, sc.normed.ptr, null, width, H, eps, .{ .round = true });
     }
-    if (d.trail) |t| try t.rows.copyFrom(0, sc.normed, width * H * 2, s.handle);
+    if (d.trail) |t| try t.rows.copyFrom(0, sc.normed.ptr, width * H * 2, s.handle);
     // One slot at a time: each row's correction reads the token before it, then the target's own head decides.
     for (0..depth) |draft_at| {
         const token = if (draft_at == 0) bonus else held[draft_at - 1];
-        const hidden = sc.normed + (draft_at + 1) * H * 2; // row 0 is the anchor's own and predicts nothing
+        const hidden = sc.normed.ptr + (draft_at + 1) * H * 2; // row 0 is the anchor's own and predicts nothing
         try sc.previous.copyFrom(0, mm.embed + @as(u64, token) * H * 2, H * 2, s.handle);
-        try k.norms.addRmsTail(s, hidden, null, d.c_hnorm, sc.norm_resid, sc.cat, null, 1, H, eps, .{ .round = true });
-        try k.norms.addRmsTail(s, sc.previous.ptr, null, d.c_enorm, sc.norm_resid, sc.cat + H * 2, null, 1, H, eps, .{ .round = true });
-        if (d.trail) |t| if (draft_at == 0) try t.cat1.copyFrom(0, sc.cat, 2 * H * 2, s.handle);
-        try k.gemm.run(s, sc.cat, d.c_gate, sc.c_gate, 1, H, 2 * H, .bf16);
-        try k.gemm.run(s, sc.cat, d.c_up, sc.c_up, 1, H, 2 * H, .bf16);
-        try k.act.swiglu(s, sc.c_gate, H, sc.c_up, H, sc.c_act, null, 1, H);
-        try k.gemm.run(s, sc.c_act, d.c_down, sc.c_down, 1, H, H, .bf16);
-        if (d.trail) |t| if (draft_at == 0) try t.delta.copyFrom(0, sc.c_down, H * 2, s.handle);
-        try d.kernels.addRows(s, sc.c_down, hidden, sc.corrected, H);
-        if (d.trail) |t| try t.corrected.copyFrom(@as(u64, draft_at) * H * 2, sc.corrected, H * 2, s.handle);
+        try k.norms.addRmsTail(s, hidden, null, d.c_hnorm, sc.norm_resid.ptr, sc.cat.ptr, null, 1, H, eps, .{ .round = true });
+        try k.norms.addRmsTail(s, sc.previous.ptr, null, d.c_enorm, sc.norm_resid.ptr, sc.cat.ptr + H * 2, null, 1, H, eps, .{ .round = true });
+        if (d.trail) |t| if (draft_at == 0) try t.cat1.copyFrom(0, sc.cat.ptr, 2 * H * 2, s.handle);
+        try k.gemm.run(s, sc.cat.ptr, d.c_gate, sc.c_gate.ptr, 1, H, 2 * H, .bf16);
+        try k.gemm.run(s, sc.cat.ptr, d.c_up, sc.c_up.ptr, 1, H, 2 * H, .bf16);
+        try k.act.swiglu(s, sc.c_gate.ptr, H, sc.c_up.ptr, H, sc.c_act.ptr, null, 1, H);
+        try k.gemm.run(s, sc.c_act.ptr, d.c_down, sc.c_down.ptr, 1, H, H, .bf16);
+        if (d.trail) |t| if (draft_at == 0) try t.delta.copyFrom(0, sc.c_down.ptr, H * 2, s.handle);
+        try d.kernels.addRows(s, sc.c_down.ptr, hidden, sc.corrected.ptr, H);
+        if (d.trail) |t| try t.corrected.copyFrom(@as(u64, draft_at) * H * 2, sc.corrected.ptr, H * 2, s.handle);
         switch (mm.lm_head.weight) {
-            .bf16 => |w| try k.gemm.run(s, sc.corrected, w, sc.logits, 1, V, H, .f32),
-            .exl3 => |w| try k.dense.decode(s, w, sc.corrected, .bf16, 1, sc.logits, .f32),
+            .bf16 => |w| try k.gemm.run(s, sc.corrected.ptr, w, sc.logits.ptr, 1, V, H, .f32),
+            .exl3 => |w| try k.dense.decode(s, w, sc.corrected.ptr, .bf16, 1, sc.logits.ptr, .f32),
         }
-        if (d.trail) |t| try t.logits.copyFrom(@as(u64, draft_at) * V * 4, sc.logits, V * 4, s.handle);
-        try d.kernels.argmaxRows(s, sc.logits, 1, V, sc.ids.ptr);
+        if (d.trail) |t| try t.logits.copyFrom(@as(u64, draft_at) * V * 4, sc.logits.ptr, V * 4, s.handle);
+        try d.kernels.argmaxRows(s, sc.logits.ptr, 1, V, sc.ids.ptr);
         try sc.ids.downloadAsync(0, std.mem.sliceAsBytes(held[draft_at..][0..1]), s.handle);
         try s.synchronize();
     }
@@ -528,16 +578,17 @@ pub fn causalKeys(base: usize, anchor: usize, row: usize, out: []u32) !usize {
     return at + 1;
 }
 
-/// A round's key lists on the host, as the reference's reuse kernel builds them: each target layer's list for a row.
-fn buildKeys(mm: *Model, d: *Draft, slot: usize, anchor: usize, row_kept: usize) !void {
+/// A round's key lists on the host, as the reference's reuse kernel builds them: each target layer's list for a row,
+/// `list_row` rows into what the pass captured for this sequence (not the head's row).
+fn buildKeys(mm: *Model, d: *Draft, slot: usize, anchor: usize, list_row: usize) !void {
     const sc = &d.scratch;
     const q = sc.seq[slot];
-    const captured = q.selected and row_kept < q.keep;
+    const captured = q.selected and list_row < q.keep;
     if (captured) {
         for (0..layers) |i| {
             const at_slot = i * sc.seq.len + slot;
-            try sc.lists[at_slot].downloadAsync(row_kept * geom.sparse_stride * 4, std.mem.sliceAsBytes(d.host_lists[i * geom.sparse_stride ..][0..geom.sparse_stride]), mm.s.handle);
-            try sc.captured[at_slot].downloadAsync(row_kept * 4, std.mem.sliceAsBytes(d.host_captured[i..][0..1]), mm.s.handle);
+            try sc.lists[at_slot].downloadAsync(list_row * geom.sparse_stride * 4, std.mem.sliceAsBytes(d.host_lists[i * geom.sparse_stride ..][0..geom.sparse_stride]), mm.s.handle);
+            try sc.captured[at_slot].downloadAsync(list_row * 4, std.mem.sliceAsBytes(d.host_captured[i..][0..1]), mm.s.handle);
         }
         try mm.s.synchronize();
     }

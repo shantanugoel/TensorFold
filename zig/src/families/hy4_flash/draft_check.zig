@@ -141,7 +141,8 @@ pub fn main(init: std.process.Init) !void {
             } else blk: {
                 const depth: u32 = @intCast(rows - 1);
                 var hold: [dfly.drafts]u32 = @splat(0);
-                try dfly.propose(m, dr, 0, at, pending, depth, if (step == 0) dfly.source(dr, 0, null) else prev_kept - 1, hold[0..depth]);
+                const from = if (step == 0) dfly.source(dr, 0, null) else dfly.Source{ .head = prev_kept - 1, .list = prev_kept - 1 };
+                try dfly.propose(m, dr, 0, at, pending, depth, from, hold[0..depth]);
                 ids[0] = pending;
                 for (0..depth) |i| ids[1 + i] = hold[i];
                 try m.passRows(ids[0..rows], c.logits, .{ .at = 0, .out = block[0 .. rows * V], .head = rows });
