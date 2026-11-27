@@ -299,8 +299,14 @@ pub const Cuda = struct {
 
     /// A prompt's images planned and encoded into `slot`: the rows it reads, the positions it sits at. A fill that
     /// resumes a kept prefix keeps the plan it was filled under, so the plan is replaced only for a different prompt.
+    /// The plan's hash is committed **after** every image is encoded: a failed encode leaves the slot with no images
+    /// and no plan, so a retry encodes again instead of resuming on rows that were never written.
     pub fn setPlan(self: *Cuda, slot: usize, images: []const lanes.stream.Image, prompt_len: usize) !void {
         const tower = self.m.vision orelse return error.NoHy4VisionTower;
+        errdefer {
+            self.m.clearImages(slot);
+            self.seq[slot].plan_hash = 0;
+        }
         const inputs = try std.heap.page_allocator.alloc(cuda_vision.Input, images.len);
         defer std.heap.page_allocator.free(inputs);
         for (images, inputs) |im, *in| in.* = .{ .at = im.at, .tokens = im.tokens, .gh = im.gh, .gw = im.gw, .hash = im.hash };
@@ -311,6 +317,12 @@ pub const Cuda = struct {
             try tower.encode(im.pixels, im.gh, im.gw, self.m.imagesOf(slot).?.rows.ptr + sp.base * cuda_vision.H * 2);
         }
         self.seq[slot].plan_hash = plan.hash;
+    }
+
+    /// Whether a fill must (re)encode its prompt's images: a plan the slot's rows were not filled under, or a slot that
+    /// still carries the hash with no rows behind it (a failed encode cleared them, `setPlan`'s errdefer).
+    fn mustEncode(seq_hash: u64, plan_hash: u64, has_rows: bool) bool {
+        return seq_hash != plan_hash or !has_rows;
     }
 
     /// `tokens` at the sequence's caches' end: the model's pass, then the ring's bookkeeping and the timers.
@@ -554,7 +566,7 @@ pub const Cuda = struct {
         const slot = if (held) |i| if (self.seq[i].stream == s) i else try self.openFill(s, ids, plan_hash) else try self.openFill(s, ids, plan_hash);
         const q = &self.seq[slot];
         if (images.len > 0) {
-            if (q.plan_hash != plan_hash or self.m.imagesOf(slot) == null) try self.setPlan(slot, images, ids.len) else q.plan_hash = plan_hash;
+            if (mustEncode(q.plan_hash, plan_hash, self.m.imagesOf(slot) != null)) try self.setPlan(slot, images, ids.len);
         } else if (self.m.imagesOf(slot) != null) self.m.clearImages(slot);
         if (q.at >= ids.len) return true;
         if (s.isCancelled()) {
@@ -594,7 +606,9 @@ pub const Cuda = struct {
         if (q.plan_hash != plan_hash) {
             // Another prompt's images: the rows behind the old plan are unreadable, and the tower's are for its rows.
             self.m.clearImages(slot);
-            q.plan_hash = plan_hash;
+            // The new plan's hash is committed by `setPlan` once its images are encoded, not here: a fill that dies in
+            // the encode must not leave a slot that names the plan it has no rows for.
+            q.plan_hash = 0;
         }
         if (self.m.len(slot) != from) {
             self.m.cut(slot, from);
@@ -880,6 +894,17 @@ test "a rewind drops 1,025 rows and no more: a row reads back 511 of its own" {
     try std.testing.expect(!c.mayRewind(1, h - 1026));
     // Two sequences' marks are their own: the second's does not move the first's.
     try std.testing.expect(c.mayRewind(0, 0));
+}
+
+test "a fill re-encodes its images when the plan is new, and after a failed encode cleared the rows" {
+    // The slot's own rows and hash agree: a later chunk of the same fill reads them, no encode.
+    try std.testing.expect(!Cuda.mustEncode(9, 9, true));
+    // Another prompt's images: the hash moved, so the plan is (re)built whatever the slot holds.
+    try std.testing.expect(Cuda.mustEncode(9, 11, true));
+    try std.testing.expect(Cuda.mustEncode(0, 11, false));
+    // The hash names the plan but no rows are behind it (an encode that died partway): a retry encodes again rather
+    // than reading rows nothing wrote.
+    try std.testing.expect(Cuda.mustEncode(11, 11, false));
 }
 
 test "a prompt resumes at its shared prefix only above the keep floor and inside the ring's bound" {
