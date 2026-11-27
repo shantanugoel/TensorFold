@@ -73,6 +73,9 @@ const Seq = struct {
     at: usize = 0, // prompt tokens filled so far
     held: [dfly.drafts]u32 = @splat(0),
     nheld: u32 = 0,
+    /// The rows the round's pass appended for this sequence: a window cut to the caches' end appends fewer than its
+    /// own width names, and `keep` cuts the history by what the pass really wrote. 0: the round ended this stream.
+    ran: u32 = 0,
     /// The drafts the last block proposed for this sequence: 0 where the block was skipped, so a held row that is
     /// only a repeat is neither proposed nor kept in the counters.
     proposed: u32 = 0,
@@ -328,6 +331,21 @@ pub const Cuda = struct {
             // read 7.3 tok/s a lane against 14.5 plain. A lone stream keeps its round whole and its gain.
             .plain_streams = self.draft_lanes,
         };
+    }
+
+    /// Ends one stream with its own error: the shared round's other windows verify on, and the host fails just this
+    /// request with `why` — what `failRound` would otherwise do to every stream of the round.
+    pub fn failStream(self: *Cuda, s: *lanes.Stream, why: []const u8) void {
+        if (self.slotOf(s)) |slot| {
+            self.seq[slot].nheld = 0;
+            self.seq[slot].proposed = 0;
+            self.seq[slot].ran = 0;
+            self.seq[slot].kept = false;
+        }
+        s.finished = true;
+        s.reason = .@"error";
+        s.problem = why;
+        std.log.warn("hy4-cuda: {s} ends alone: {s}", .{ s.id, why });
     }
 
     pub fn backend(self: *Cuda) be.Backend {
@@ -713,6 +731,28 @@ test "a free slot is chosen by the kept history it shares, so a multi-turn promp
     // No free slot at all.
     c.seq[0] = .{ .stream = &s };
     try std.testing.expectError(error.NoFreeSlot, c.openSlot(&s, &prompt));
+}
+
+test "a window that cannot run ends its own stream, not the round's other windows" {
+    var m: model.Model = undefined;
+    m.slots = 1;
+    var s: lanes.Stream = undefined;
+    s.id = "t";
+    var c: Cuda = undefined;
+    c.m = &m;
+    c.slots = 1;
+    c.seq = @splat(Seq{});
+    c.seq[0] = .{ .stream = &s, .at = 7, .ran = 6, .proposed = 3, .nheld = 2 };
+    c.failStream(&s, "the reply's next window runs past the context's caches");
+    // The host fails this request with these words; the round's other streams are untouched (nothing global is set).
+    try std.testing.expect(s.finished and s.reason == .@"error");
+    try std.testing.expectEqualStrings("the reply's next window runs past the context's caches", s.problem);
+    // Its slot keeps the rows its own rounds landed, and claims no pass of this round.
+    try std.testing.expectEqual(@as(u32, 7), c.seq[0].at);
+    try std.testing.expectEqual(@as(u32, 0), c.seq[0].ran);
+    try std.testing.expectEqual(@as(u32, 0), c.seq[0].proposed);
+    try std.testing.expectEqual(@as(u32, 0), c.seq[0].nheld);
+    try std.testing.expect(!c.seq[0].kept);
 }
 
 test "a rewind is allowed exactly while the ring still holds the rows its first window reads" {
