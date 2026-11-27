@@ -82,6 +82,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_HY4_MEM_FLOOR_GIB", .scope = .cuda, .kind = .size, .forms = "whole GiB of MemAvailable below which the Hy4-flash CUDA loader stops (default 10)" },
     .{ .name = "TF_HY4_SERVE_FLOOR_GIB", .scope = .cuda, .kind = .size, .forms = "whole GiB of MemAvailable the Hy4-flash CUDA server keeps after its last load-time allocation (default 8)" },
     .{ .name = "TF_HY4_ROUND_LOG", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 logs every verify window's rows, their draws and what the round kept; default 0)" },
+    .{ .name = "TF_HY4_DRAFT_LANES", .scope = .cuda, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (a shared round with this many busy lanes or more drafts none; default 2, 0: never)" },
     // Qwen 3.5 CUDA and HIP settings, read through this table:
     .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .scope = .cuda, .kind = .real, .forms = "a finite GiB amount (the HIP admission's floor and the memory's size still bound it)" },
     .{ .name = "TENSORFOLD_HIP_MEMORY_LIMIT_GB", .scope = .cuda, .kind = .real, .forms = "a finite GiB amount (the HIP admission still fits its byte count in a 64-bit size)" },

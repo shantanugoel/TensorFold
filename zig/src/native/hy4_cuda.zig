@@ -181,12 +181,11 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         break :ret null;
     };
     if (timed) |t| {
-        for (&windows, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t.rows[i] };
+        // A drafted round's pass carries the block's fixed charge, so the widths past one row are priced with it and
+        // the slope is what each draft adds. The one-row price stays the plain step's: it drafts nothing.
+        for (&windows, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t.rows[i] + if (i > 0) t.fixed else 0 };
         facts.window_costs = &windows;
-        facts.fixed_draft_block = t.fixed_block;
-        // The block is a round's fixed charge: with a fixed block, `draftHeadMs` prices a positive depth at `drafts`
-        // slots, so the slot price is the whole block over the drafts it was timed at.
-        facts.mtp_step_ms = if (t.fixed_block) t.block / @as(f64, @floatFromInt(@max(drafts, 1))) else t.block;
+        facts.mtp_step_ms = t.per;
     }
     h.cfg = try lanes.Config.init(gpa, facts, family.max_window, drafts);
     errdefer h.cfg.deinit(gpa);

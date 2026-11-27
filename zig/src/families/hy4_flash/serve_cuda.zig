@@ -284,13 +284,26 @@ pub const Cuda = struct {
         return .{ .ptr = self, .keep_full_lone = true, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .cancel_prefill = cancelPrefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = round.verifyFn, .keep = round.keepFn, .draft = round.draftFn, .held = round.heldFn, .first_row = firstRowFn, .release = releaseFn, .reports_fill = true } };
     }
 
-    /// The window widths and a draft block's cost by depth, timed once at load: the depth rule prices a round
-    /// from these. A block runs the same six rows at any depth, so its price is a round's fixed charge, not a slope.
-    pub const Timed = struct { rows: [max_window]f64 = @splat(0), block: f64 = 0, fixed_block: bool = true };
+    /// The window widths and a draft block's price, timed once at load at depth 1 and at `drafts`: a block costs
+    /// what its first slot costs plus a little for each more, so the rule prices a round as `fixed + per * drafts`.
+    pub const Timed = struct {
+        rows: [max_window]f64 = @splat(0), // a pass by rows
+        block: [2]f64 = .{ 0, 0 }, // the block at depth 1, and at `drafts`
+        fixed: f64 = 0, // the block's charge at any positive depth
+        per: f64 = 0, // and what each draft past the first adds
+    };
+
+    /// The block's fixed charge and its slope per draft, from the two depths timed (drafts 1: all fixed).
+    pub fn blockPrice(shallow: f64, deep: f64, slots: u32) Timed {
+        const fixed = @max(shallow, 0);
+        if (slots < 2 or deep <= shallow) return .{ .fixed = fixed, .per = 0, .block = .{ shallow, deep } };
+        const per = (deep - shallow) / @as(f64, @floatFromInt(slots - 1));
+        return .{ .fixed = @max(fixed - per, 0), .per = per, .block = .{ shallow, deep } };
+    }
 
     pub fn timeWindows(self: *Cuda) !Timed {
         const dr = if (self.m.draft) |*x| x else return .{};
-        var timed: Timed = .{ .block = 0, .fixed_block = true };
+        var timed: Timed = .{};
         var ids: [dfly.width + 2]u32 = @splat(0);
         for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
         try self.pass(0, &ids);
@@ -318,14 +331,16 @@ pub const Cuda = struct {
                 if (which == 1) block[depth] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds())) / 1e6;
             }
         }
-        // The block keeps a fixed six rows whatever its depth: a flat pair prices a block as a fixed charge.
+        // The block's own price: its first slot's cost, plus what each draft past it adds.
         const shallow = block[1];
         const deep = block[@min(self.drafts, dfly.drafts)];
-        timed.fixed_block = self.drafts < 2 or deep <= shallow * 1.25;
-        timed.block = @max(shallow, deep);
-        std.log.info("hy4-cuda: window ms by rows {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2}, a draft block {d:.2} ms at one slot and {d:.2} at {d}: {s} a round's cost", .{
+        const price = blockPrice(shallow, deep, self.drafts);
+        timed.block = .{ shallow, deep };
+        timed.fixed = price.fixed;
+        timed.per = price.per;
+        std.log.info("hy4-cuda: window ms by rows {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2}, a draft block {d:.2} ms at one slot and {d:.2} at {d}: {d:.2} ms fixed and {d:.2} a draft", .{
             timed.rows[0], timed.rows[1], timed.rows[2], timed.rows[3], timed.rows[4], timed.rows[5],
-            shallow,    deep,    self.drafts,    if (timed.fixed_block) "fixed" else "linear",
+            shallow,    deep,    self.drafts,    timed.fixed,     timed.per,
         });
         // The warm rows go: the first stream fills from row 0 as on a cold load, in every sequence.
         for (self.seq[0..self.slots]) |*q| q.* = .{};
@@ -481,6 +496,22 @@ fn roundBf16(v: f32) u16 {
     if ((bits & 0x7f800000) == 0x7f800000 and (bits & 0x007fffff) != 0) return @intCast((bits >> 16) | 0x0040);
     const half = (bits + 0x7fff + ((bits >> 16) & 1)) >> 16;
     return @intCast(half & 0xffff);
+}
+
+test "a draft block prices as a fixed charge and a slope per draft" {
+    // Depth 1 and depth 5 on a GB10: 9.46 and 17.61 ms. A round pays the first slot whole and a little for more.
+    const p = Cuda.blockPrice(9.46, 17.61, 5);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.4225), p.fixed, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0375), p.per, 1e-3);
+    // A flat block (the same cost at any depth) is all fixed charge.
+    const flat = Cuda.blockPrice(9.46, 9.46, 5);
+    try std.testing.expectEqual(@as(f64, 9.46), flat.fixed);
+    try std.testing.expectEqual(@as(f64, 0), flat.per);
+    // One draft is all fixed, and a cheaper deep block does not price the shallow one below its own cost.
+    const one = Cuda.blockPrice(9.46, 0, 1);
+    try std.testing.expectEqual(@as(f64, 9.46), one.fixed);
+    const odd = Cuda.blockPrice(12, 11, 5);
+    try std.testing.expectEqual(@as(f64, 12), odd.fixed);
 }
 
 test "a request fills the caches less the room a round's window writes past its last token" {
