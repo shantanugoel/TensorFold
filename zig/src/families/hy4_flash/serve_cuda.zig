@@ -309,14 +309,6 @@ pub const Cuda = struct {
         self.seq[slot].plan_hash = plan.hash;
     }
 
-    /// The images a prompt carries, hashed with their places: what a kept prefix must share to be resumed.
-    fn planHash(images: []const lanes.stream.Image, prompt_len: usize) u64 {
-        var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
-        h.update(std.mem.asBytes(&prompt_len));
-        for (images) |im| h.update(std.mem.asBytes(&[_]u64{ im.hash, im.at, im.tokens }));
-        return h.final();
-    }
-
     /// `tokens` at the sequence's caches' end: the model's pass, then the ring's bookkeeping and the timers.
     pub fn pass(self: *Cuda, slot: usize, tokens: []const u32) !void {
         const start = self.m.len(slot);
@@ -554,7 +546,7 @@ pub const Cuda = struct {
         const inputs = try std.heap.page_allocator.alloc(cuda_vision.Input, images.len);
         defer std.heap.page_allocator.free(inputs);
         for (images, inputs) |im, *in| in.* = .{ .at = im.at, .tokens = im.tokens, .gh = im.gh, .gw = im.gw, .hash = im.hash };
-        const plan_hash: u64 = if (images.len == 0) 0 else cuda_vision.hashOf(inputs, ids.len);
+        const plan_hash: u64 = if (images.len == 0) 0 else cuda_vision.hashOf(inputs);
         const slot = if (held) |i| if (self.seq[i].stream == s) i else try self.openFill(s, ids, plan_hash) else try self.openFill(s, ids, plan_hash);
         const q = &self.seq[slot];
         if (images.len > 0) {

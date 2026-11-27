@@ -51,9 +51,12 @@ pub const Span = struct {
 /// The identity of a prompt's images and their places in it: a kept prefix is resumed only under the same plan, because
 /// an image's rows carry its own 3-axis positions. 0 is not a plan (a text-only prompt), so the text path's reuse is
 /// exactly what it was.
-pub fn hashOf(inputs: []const Input, prompt_len: usize) u64 {
+///
+/// The prompt's **length is not part of it**: an image's rows are fixed by the images and the text before them, so a
+/// longer prompt — the same conversation with another turn — extends the text tail and moves no image row. Including
+/// the length would make every turn of an image conversation a fresh fill, which is the case a kept prefix is for.
+pub fn hashOf(inputs: []const Input) u64 {
     var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
-    h.update(std.mem.asBytes(&prompt_len));
     for (inputs) |im| h.update(std.mem.asBytes(&[_]u64{ im.hash, im.at, im.tokens }));
     return h.final();
 }
@@ -73,7 +76,7 @@ pub const Plan = struct {
     pub fn build(a: std.mem.Allocator, inputs: []const Input, prompt_len: usize) !Plan {
         const spans = try a.alloc(Span, inputs.len);
         errdefer a.free(spans);
-        var plan: Plan = .{ .a = a, .spans = spans, .prompt_len = prompt_len, .rows = 0, .delta = 0, .hash = hashOf(inputs, prompt_len) };
+        var plan: Plan = .{ .a = a, .spans = spans, .prompt_len = prompt_len, .rows = 0, .delta = 0, .hash = hashOf(inputs) };
         var cursor: usize = 0; // the first prompt row not yet placed
         var next: i32 = 0; // where the next placed row's position starts
         for (inputs, 0..) |im, i| {
@@ -188,6 +191,29 @@ test "two back-to-back images get a block each, and the second's feature rows fo
     try std.testing.expectEqual(@as(i32, 8 - 14), plan.delta);
     try std.testing.expectEqual(@as(i32, 6), plan.featureRow(7));
     try std.testing.expectEqual(@as(i32, 11), plan.featureRow(12));
+}
+
+test "a kept prefix's plan identity is the images and their places, not the prompt's length" {
+    const a = std.testing.allocator;
+    const one = [_]Input{.{ .at = 2, .tokens = 8, .gh = 4, .gw = 6, .hash = 7 }};
+    // The same conversation with one more turn: the image is at the same row with the same bytes, so the kept rows
+    // are resumable — the prompt's tail is longer and no image row moves.
+    var short = try Plan.build(a, &one, 14);
+    defer short.deinit();
+    var long = try Plan.build(a, &one, 40);
+    defer long.deinit();
+    try std.testing.expectEqual(short.hash, long.hash);
+    // Two prompts, one image, the same rows: the same plan whatever else each carries.
+    var again = try Plan.build(a, &one, 21);
+    defer again.deinit();
+    try std.testing.expectEqual(short.hash, again.hash);
+    // Another image, or the same one further along the prompt, is another plan: its rows carry other positions.
+    var moved = try Plan.build(a, &.{.{ .at = 3, .tokens = 8, .gh = 4, .gw = 6, .hash = 7 }}, 40);
+    defer moved.deinit();
+    try std.testing.expect(moved.hash != long.hash);
+    var other = try Plan.build(a, &.{.{ .at = 2, .tokens = 8, .gh = 4, .gw = 6, .hash = 8 }}, 40);
+    defer other.deinit();
+    try std.testing.expect(other.hash != long.hash);
 }
 
 test "a plan refuses an image whose rows do not match its grid, and one that overlaps or overruns the prompt" {
