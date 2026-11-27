@@ -183,15 +183,18 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     if (timed) |t| {
         for (&windows, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t.rows[i] };
         facts.window_costs = &windows;
-        facts.mtp_step_ms = t.slot_ms;
+        facts.fixed_draft_block = t.fixed_block;
+        // The block is a round's fixed charge: with a fixed block, `draftHeadMs` prices a positive depth at `drafts`
+        // slots, so the slot price is the whole block over the drafts it was timed at.
+        facts.mtp_step_ms = if (t.fixed_block) t.block / @as(f64, @floatFromInt(@max(drafts, 1))) else t.block;
     }
-    h.cfg = try lanes.Config.init(gpa, facts, family.max_window, family.max_window - 1);
+    h.cfg = try lanes.Config.init(gpa, facts, family.max_window, drafts);
     errdefer h.cfg.deinit(gpa);
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.c.backend(), h.clock.clock());
     errdefer h.core.deinit();
     h.startup = try std.fmt.allocPrint(gpa, "CUDA device {d}: Hy4-flash {d}-token context x {d} sequences ({d:.2} GiB KV + {d:.2} GiB indexer keys + {d:.0} MiB ring + {d:.0} MiB recall scores), {d:.2} GiB weights, {d:.1} GiB free after the load, DFly2 {s}", .{
-        device,                       capacity,                    o.lanes,
+        device,                       family.Cuda.served(h.c),     o.lanes,
         gib(bytes.kv),                gib(bytes.index),
         @as(f64, @floatFromInt(bytes.ring)) / (1 << 20), @as(f64, @floatFromInt(bytes.scores)) / (1 << 20),
         gib(h.c.m.weight_bytes),      gib(avail),
@@ -201,7 +204,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.host = api.LaneHost.init(gpa, io, &h.core, .{
         .name = "hy4-cuda",
         .lanes = o.lanes,
-        .context_window = capacity,
+        .context_window = family.Cuda.served(h.c),
         .prefill_step = family.prompt_rows,
         .structures = true,
         .logprobs = true,

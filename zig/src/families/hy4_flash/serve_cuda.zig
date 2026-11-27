@@ -47,6 +47,11 @@ pub fn memAvailable() u64 {
     return @import("cuda_load_util.zig").memAvailable();
 }
 
+/// The positions a request may fill with `drafts` a round: the caches' rows less the room a round's window needs.
+pub fn serveCap(capacity: usize, rounds: u32) usize {
+    return if (capacity > @as(usize, rounds)) capacity - @as(usize, rounds) else capacity;
+}
+
 /// Per-token bytes the caches take at this capacity over every sequence: the KV, the indexer's keys and the scores.
 pub fn bytesPerToken(m: *const model.Model) u64 {
     const b = cacheBytes(m);
@@ -62,6 +67,9 @@ const Seq = struct {
     at: usize = 0, // prompt tokens filled so far
     held: [dfly.drafts]u32 = @splat(0),
     nheld: u32 = 0,
+    /// The drafts the last block proposed for this sequence: 0 where the block was skipped, so a held row that is
+    /// only a repeat is neither proposed nor kept in the counters.
+    proposed: u32 = 0,
 };
 
 pub const Cuda = struct {
@@ -69,6 +77,12 @@ pub const Cuda = struct {
     io: std.Io,
     m: *model.Model,
     vocab: u32,
+    /// The drafts a round proposes at most: `--mtp-drafts`, 0 without a drafter.
+    drafts: u32,
+    /// The positions a request may fill: the caches' rows less the drafts a round's window writes past the last token.
+    serve_cap: usize,
+    /// `TF_HY4_DRAFT_LANES`: a shared round with this many busy lanes or more drafts none (2: only a lone stream).
+    draft_lanes: u32,
     logits: []f32, // the row at hand, FP32 as the model writes it
     window: []f32, // every row of a round's windows, `vocab` wide each
     words: []u16, // the row at hand as bf16 words, for the lane sampler
@@ -103,6 +117,11 @@ pub const Cuda = struct {
             .io = io,
             .m = m,
             .vocab = @intCast(vocab),
+            .drafts = rounds,
+            // A round verifies `1 + drafts` rows at the history's end, so a request stops that many rows short of the
+            // caches: without the reserve, a reply that fills the context dies on its last window (Hy4ContextFull).
+            .serve_cap = serveCap(capacity, rounds),
+            .draft_lanes = @import("sys").environment.read(u32, "TF_HY4_DRAFT_LANES", 2) catch 2,
             .logits = window[0..vocab],
             .window = window,
             .words = try a.alloc(u16, vocab),
@@ -123,6 +142,11 @@ pub const Cuda = struct {
 
     pub fn bytes(self: *const Cuda) Bytes {
         return cacheBytes(self.m);
+    }
+
+    /// The context a request may fill: the caches' rows less the drafts a round's window writes past its last token.
+    pub fn served(self: *const Cuda) u32 {
+        return @intCast(self.serve_cap);
     }
 
     /// The slot the stream holds; null before the first prompt chunk handed it one.
@@ -167,7 +191,7 @@ pub const Cuda = struct {
         const start = self.m.len(slot);
         self.logits = self.window[0..self.vocab];
         // Inside `capacity` every write slot is inside its sequence's arena: a stray one is skipped silently.
-        if (start + tokens.len > self.m.capacity) return error.Hy4ContextFull;
+        if (start + tokens.len > self.serve_cap) return error.Hy4ContextFull;
         // The model appends before it forwards: a failed pass leaves the history claiming rows nothing wrote.
         errdefer {
             self.m.cut(slot, start);
@@ -239,7 +263,7 @@ pub const Cuda = struct {
             .mtp = tower,
             .speculate = tower,
             .speculate_early = false,
-            .drafts = if (tower) @intCast(dfly.drafts) else 0,
+            .drafts = if (tower) self.drafts else 0,
             .copy_drafts = false,
             .lone_copies = false,
             .hidden_rows = self.slots > 1,
@@ -247,6 +271,10 @@ pub const Cuda = struct {
             .streams_exact = true,
             .batch_rows = @intCast(self.batch_rows),
             .max_streams = @intCast(self.slots),
+            // Drafting at several busy lanes costs more than it saves here: a shared round runs every sequence's
+            // block one after another (5 layers of six rows and a synced head a slot each), so four streams drafting
+            // read 7.3 tok/s a lane against 14.5 plain. A lone stream keeps its round whole and its gain.
+            .plain_streams = self.draft_lanes,
         };
     }
 
@@ -256,12 +284,13 @@ pub const Cuda = struct {
         return .{ .ptr = self, .keep_full_lone = true, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .cancel_prefill = cancelPrefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = round.verifyFn, .keep = round.keepFn, .draft = round.draftFn, .held = round.heldFn, .first_row = firstRowFn, .release = releaseFn, .reports_fill = true } };
     }
 
-    /// The window widths and a draft slot, timed once at load: the depth rule prices a round from these.
-    pub const Timed = struct { rows: [max_window]f64 = @splat(0), slot_ms: f64 = 0 };
+    /// The window widths and a draft block's cost by depth, timed once at load: the depth rule prices a round
+    /// from these. A block runs the same six rows at any depth, so its price is a round's fixed charge, not a slope.
+    pub const Timed = struct { rows: [max_window]f64 = @splat(0), block: f64 = 0, fixed_block: bool = true };
 
     pub fn timeWindows(self: *Cuda) !Timed {
         const dr = if (self.m.draft) |*x| x else return .{};
-        var timed: Timed = .{};
+        var timed: Timed = .{ .block = 0, .fixed_block = true };
         var ids: [dfly.width + 2]u32 = @splat(0);
         for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
         try self.pass(0, &ids);
@@ -277,17 +306,26 @@ pub const Cuda = struct {
             std.mem.sort(f64, &times, {}, std.sort.asc(f64));
             timed.rows[width - 1] = times[1];
         }
-        // A draft slot's cost over a block of three: the first call also warms the tower's own path.
+        // A block at the shallowest and deepest depth a round asks for: one and `drafts` slots, each timed twice.
         var held: [dfly.drafts]u32 = @splat(0);
-        const head = dfly.source(dr, 0, null);
-        self.m.cut(0, at);
-        for (0..2) |which| {
-            const t0 = std.Io.Clock.awake.now(self.io);
-            try dfly.propose(self.m, dr, 0, at, ids[at - 1], 3, head, held[0..3]);
-            if (which == 1) timed.slot_ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds())) / 1e6 / 3;
+        var block: [dfly.drafts + 1]f64 = @splat(0); // by depth: 0 is never asked for
+        for ([_]u32{ 1, self.drafts }) |depth| {
+            const from = dfly.source(dr, 0, null);
+            self.m.cut(0, at);
+            for (0..2) |which| {
+                const t0 = std.Io.Clock.awake.now(self.io);
+                try dfly.propose(self.m, dr, 0, at, ids[at - 1], depth, from, held[0..depth]);
+                if (which == 1) block[depth] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds())) / 1e6;
+            }
         }
-        std.log.info("hy4-cuda: window ms by rows {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2}, draft {d:.2} ms a slot", .{
-            timed.rows[0], timed.rows[1], timed.rows[2], timed.rows[3], timed.rows[4], timed.rows[5], timed.slot_ms,
+        // The block keeps a fixed six rows whatever its depth: a flat pair prices a block as a fixed charge.
+        const shallow = block[1];
+        const deep = block[@min(self.drafts, dfly.drafts)];
+        timed.fixed_block = self.drafts < 2 or deep <= shallow * 1.25;
+        timed.block = @max(shallow, deep);
+        std.log.info("hy4-cuda: window ms by rows {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2}, a draft block {d:.2} ms at one slot and {d:.2} at {d}: {s} a round's cost", .{
+            timed.rows[0], timed.rows[1], timed.rows[2], timed.rows[3], timed.rows[4], timed.rows[5],
+            shallow,    deep,    self.drafts,    if (timed.fixed_block) "fixed" else "linear",
         });
         // The warm rows go: the first stream fills from row 0 as on a cold load, in every sequence.
         for (self.seq[0..self.slots]) |*q| q.* = .{};
@@ -310,7 +348,7 @@ pub const Cuda = struct {
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = cast(ptr);
         const ids = s.prompt();
-        if (ids.len + s.max_new > self.m.capacity) return error.Hy4ContextFull;
+        if (ids.len + s.max_new > self.serve_cap) return error.Hy4ContextFull;
         const t0 = std.Io.Clock.awake.now(self.io);
         while (!try self.prefillStep(s, 0)) {}
         const from = self.seq[self.slotOf(s) orelse return error.NoFreeSlot].from;
@@ -322,7 +360,7 @@ pub const Cuda = struct {
     /// tool's whole fill, where a served prompt goes through `prefillStep` a chunk a call.
     pub fn fillIds(self: *Cuda, ids: []const u32) !usize {
         if (ids.len == 0) return error.EmptyHy4Prompt;
-        if (ids.len > self.m.capacity) return error.Hy4ContextFull;
+        if (ids.len > self.serve_cap) return error.Hy4ContextFull;
         const from = self.reuseFrom(0, ids);
         var at = from;
         while (at < ids.len) {
@@ -341,7 +379,7 @@ pub const Cuda = struct {
     pub fn prefillStep(self: *Cuda, s: *lanes.Stream, max_rows: u32) !bool {
         const ids = s.prompt();
         if (ids.len == 0) return error.EmptyHy4Prompt;
-        if (ids.len + s.max_new > self.m.capacity) return error.Hy4ContextFull;
+        if (ids.len + s.max_new > self.serve_cap) return error.Hy4ContextFull;
         const slot = self.slotOf(s) orelse blk: {
             const i = try self.openSlot(s);
             const q = &self.seq[i];
@@ -443,6 +481,33 @@ fn roundBf16(v: f32) u16 {
     if ((bits & 0x7f800000) == 0x7f800000 and (bits & 0x007fffff) != 0) return @intCast((bits >> 16) | 0x0040);
     const half = (bits + 0x7fff + ((bits >> 16) & 1)) >> 16;
     return @intCast(half & 0xffff);
+}
+
+test "a request fills the caches less the room a round's window writes past its last token" {
+    // A reply that fills the context ends with a window of `1 + drafts` rows: without the reserve the last one
+    // runs past the caches and the request dies on Hy4ContextFull.
+    try std.testing.expectEqual(@as(usize, 262_139), serveCap(262_144, 5));
+    try std.testing.expectEqual(@as(usize, 262_142), serveCap(262_144, 2));
+    try std.testing.expectEqual(@as(usize, 262_144), serveCap(262_144, 0));
+    // A context smaller than the drafts keeps its rows rather than wrapping.
+    try std.testing.expectEqual(@as(usize, 4), serveCap(4, 5));
+}
+
+test "a round drafts only at one busy lane, and never more drafts than `--mtp-drafts` names" {
+    var m: model.Model = undefined;
+    m.draft = null; // no tower: nothing to propose, so no window to widen
+    var c: Cuda = undefined;
+    c.m = &m;
+    c.slots = 4;
+    c.batch_rows = 24;
+    c.drafts = 0;
+    c.draft_lanes = 2;
+    const f = c.facts();
+    try std.testing.expectEqual(@as(u32, 0), f.drafts);
+    try std.testing.expect(!f.mtp and !f.speculate);
+    // A shared round of two streams or more drafts none: its block runs a sequence at a time, and measured that
+    // costs more than the drafts it lands (4 lanes: 7.3 tok/s a lane against 14.5 plain).
+    try std.testing.expectEqual(@as(u32, 2), f.plain_streams);
 }
 
 test "a logit rounds to the bf16 word the head would write, ties to even" {

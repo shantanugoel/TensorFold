@@ -488,7 +488,8 @@ pub const Model = struct {
                 held = true;
             }
         }
-        if (!held) try self.headRows(s, x, rows - 1, 1, logits_out, @min(geom.head_block, rows));
+        // One row of logits runs one head row: the pass's block width here would read past the pass's own rows.
+        if (!held) try self.headRows(s, x, rows - 1, 1, logits_out, @min(geom.head_block, 1));
     }
 
     /// Whether `part` lies wholly inside `whole`: a verify window's last row must not overwrite its first.

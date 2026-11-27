@@ -28,6 +28,7 @@ pub fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified)
         const slot = self.slotOf(w.stream) orelse return error.UnknownHy4Stream;
         const q = &self.seq[slot];
         const base = self.m.len(slot);
+        if (base + rows > self.m.capacity) return error.Hy4ContextFull;
         for (w.positions, 0..) |p, r| if (p != base + r + 1) return error.InvalidHy4Position;
         ids[i][0] = w.pending;
         // The drafts the last proposal held, then the host's; a wider window repeats its last.
@@ -35,11 +36,14 @@ pub fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified)
         @memcpy(ids[i][1..][0..held], q.held[0..held]);
         for (held..w.held) |k| ids[i][1 + k] = if (held > 0) q.held[held - 1] else w.pending;
         @memcpy(ids[i][1 + w.held ..][0..w.tokens.len], w.tokens);
+        // A row the block skipped (near the context's end) or that no proposal made is not a draft of this round.
+        const real = @min(@as(usize, w.held), @as(usize, q.proposed));
         q.nheld = 0;
+        q.proposed = @intCast(real); // `keep` reads the round's own proposals after this pass, and clears them
         @memcpy(o.drafts, ids[i][1..rows]);
-        if (w.held > 0) {
+        if (real > 0) {
             self.draft_rounds += 1;
-            self.draft_proposed += w.held;
+            self.draft_proposed += real;
             if (self.log_rounds) std.log.info("hy4-cuda: round {d} at row {d}: window {any}", .{ self.draft_rounds, base, ids[i][0..rows] });
         }
         runs[i] = .{ .slot = slot, .tokens = ids[i][0..rows] };
@@ -91,9 +95,12 @@ pub fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []cons
         const base = self.m.len(slot);
         if (base < rows) return error.InvalidHy4Position;
         self.m.cut(slot, base - rows + path.len);
-        if (path.len > 1) self.draft_kept += path.len - 1;
-        if (self.log_rounds) std.log.info("hy4-cuda: round {d} kept {d} of {d} rows (drafts {d} of {d}), history {d} -> {d}", .{ self.draft_rounds, path.len, rows, path.len - 1, rows - 1, base, self.m.len(slot) });
+        // Rows a verified draft kept: a repeated row (the block was skipped) or a host token is not one.
+        const kept = @min(@as(usize, path.len - 1), @as(usize, self.seq[slot].proposed));
+        self.draft_kept += kept;
+        if (self.log_rounds) std.log.info("hy4-cuda: round {d} kept {d} of {d} rows (drafts {d} of {d}), history {d} -> {d}", .{ self.draft_rounds, path.len, rows, kept, self.seq[slot].proposed, base, self.m.len(slot) });
         self.seq[slot].nheld = 0;
+        self.seq[slot].proposed = 0;
     }
 }
 
@@ -104,7 +111,8 @@ pub fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) !void {
     for (requests) |r| {
         const slot = self.slotOf(r.stream) orelse return error.UnknownHy4Stream;
         self.seq[slot].nheld = 0;
-        if (r.depth > dfly.drafts) return error.UnsupportedHy4Window;
+        self.seq[slot].proposed = 0;
+        if (r.depth > self.drafts) return error.UnsupportedHy4Window;
         // The anchor is the cache length after this round's keep: a shared round drafts before it cuts the window.
         if (r.position == 0) return error.InvalidHy4Position;
         const anchor: usize = @intCast(r.position - 1);
@@ -126,18 +134,19 @@ pub fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) !void {
             self.seq[slot].nheld = r.depth;
             continue;
         }
-        const head = dfly.source(dr, slot, kept);
+        const from = dfly.source(dr, slot, kept);
         const t0 = std.Io.Clock.awake.now(self.io);
-        try dfly.propose(self.m, dr, slot, anchor, bonus, r.depth, head, self.seq[slot].held[0..r.depth]);
-        if (self.draft_rounds <= 3) std.log.info("hy4-cuda: DFly2 block at {d} from row {d} in slot {d}: bonus {d}, proposals {any}", .{ anchor, head, slot, bonus, self.seq[slot].held[0..r.depth] });
+        try dfly.propose(self.m, dr, slot, anchor, bonus, r.depth, from, self.seq[slot].held[0..r.depth]);
+        if (self.draft_rounds <= 3) std.log.info("hy4-cuda: DFly2 block at {d} from row {d} in slot {d}: bonus {d}, proposals {any}", .{ anchor, from.head, slot, bonus, self.seq[slot].held[0..r.depth] });
         self.draft_ns += t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
         self.seq[slot].nheld = r.depth;
-        if (self.draft_rounds % 16 == 0) std.log.info("hy4-cuda: DFly2 {d:.2} accepted a draft over {d} steps ({d} proposed, {d} kept), {d:.1} ms a proposal", .{
-            if (self.draft_rounds == 0) 0 else @as(f64, @floatFromInt(self.draft_kept)) / @as(f64, @floatFromInt(self.draft_rounds)),
+        self.seq[slot].proposed = r.depth;
+        if (self.draft_rounds > 0 and self.draft_rounds % 16 == 0) std.log.info("hy4-cuda: DFly2 {d:.2} drafts kept a round over {d} rounds ({d} proposed, {d} kept), {d:.1} ms a proposal", .{
+            @as(f64, @floatFromInt(self.draft_kept)) / @as(f64, @floatFromInt(self.draft_rounds)),
             self.draft_rounds,
             self.draft_proposed,
             self.draft_kept,
-            @as(f64, @floatFromInt(self.draft_ns)) / 1e6 / @as(f64, @floatFromInt(self.draft_proposed)),
+            @as(f64, @floatFromInt(self.draft_ns)) / 1e6 / @as(f64, @floatFromInt(@max(self.draft_proposed, 1))),
         });
     }
     self.logits = self.window[0..self.vocab];
