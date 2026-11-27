@@ -24,7 +24,7 @@ const ring_rows: u32 = geom.ring.rows;
 const ring_window: u32 = geom.ring.window;
 /// The prompt prefix a reuse shares before its caches are kept rather than refilled from row 0.
 const keep_prefix = 64;
-/// A shared round's rows at most: every sequence's widest window, and never below the engine's own default.
+/// A shared round's rows at most: every sequence's window at its widest, and never below the engine's default 32.
 pub fn batchRows(slots: usize) usize {
     return @max(32, slots * @max(@as(usize, max_window), 1));
 }
@@ -312,7 +312,9 @@ pub const Cuda = struct {
     /// The draw a reply starts from, and the one a window row takes: a loaded drafter widens both to its block.
     pub fn facts(self: *const Cuda) lanes.Model {
         const tower = self.m.draft != null;
-        // `streams_exact` is the engine's "may several streams share a forward": each sequence's rows are its own.
+        // `streams_exact` is the engine's switch for shared rounds, not a promise about their bits: what it buys here is
+        // that each sequence's rows read and write its own caches, keys and positions. A shared pass still moves the
+        // bits (the kb's "Not an exactness claim"), which is why `--parallel 1` is the byte-identical arm.
         return .{
             .exact_width = if (tower) max_window else 1,
             .mtp = tower,
