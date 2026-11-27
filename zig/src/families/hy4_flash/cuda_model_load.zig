@@ -13,7 +13,7 @@ const engram = @import("engram.zig");
 const engram_cuda = @import("engram_cuda.zig");
 const direct = @import("bf16_rows.zig");
 const geom = @import("cuda_scratch.zig");
-const kv8 = @import("cuda_kv8.zig");
+const format = @import("cuda_kv8.zig");
 const cuda_index = @import("cuda_index.zig");
 const model = @import("cuda_model.zig");
 const dfly = @import("cuda_draft.zig");
@@ -175,7 +175,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     var indexers: usize = 0;
     var fp8: usize = 0;
     for (self.layers) |layer| {
-        kv_bytes += @as(usize, layer.attention.rows) * kv8.rowBytes(layer.attention.kv8 != null);
+        kv_bytes += @as(usize, layer.attention.rows) * format.rowBytes(layer.attention.kv8 != null);
         sliding += @intFromBool(layer.attention.sliding);
         fp8 += @intFromBool(layer.attention.kv8 != null);
         if (layer.attention.index) |ix| {
@@ -186,7 +186,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     std.debug.print("capacity {d}: KV {d:.2} GiB ({d} B a token over {d} indexed layers, {d} of them E4M3, {d} sliding at {d} rows), indexer keys {d:.2} GiB ({d} B a token over {d} layers), recall scores {d:.0} MiB\n", .{
         self.capacity,
         load_util.gib(kv_bytes),
-        (self.layers.len - sliding) * kv8.rowBytes(self.kv8),
+        (self.layers.len - sliding) * format.rowBytes(self.kv8),
         self.layers.len - sliding,
         fp8,
         sliding,

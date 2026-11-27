@@ -56,15 +56,16 @@ test "the E4M3 row round-trips within the format's bound, and the rope plane exa
     const random = prng.random();
     var row: [m.latent]f32 = undefined;
     var codes: [m.latent]u8 = undefined;
-    var worst: f64 = 0;
+    var worst: f64 = 0; // the largest relative error of a normal value
     var sum: f64 = 0;
     for (0..64) |trial| {
         // Real latents have no outliers (K2's Q8 round trip found 1.5-1.9x the median channel): a spread of scales,
         // one large channel, and a row that is all zeros.
+        const spread: f32 = 1.0 + @as(f32, @floatFromInt(trial % 5));
         for (&row, 0..) |*x, i| x.* = switch (trial) {
             0 => 0,
             1 => if (i == 0) 12.5 else 0.1,
-            else => random.floatNorm(f32) * (1.0 + trial % 5) * 0.25,
+            else => random.floatNorm(f32) * spread * 0.25,
         };
         const scale = try pack(&row, &codes);
         var amax: f32 = 0;
@@ -75,19 +76,19 @@ test "the E4M3 row round-trips within the format's bound, and the rope plane exa
         for (row, codes) |x, bits| {
             const back = value(bits, scale);
             const err = @abs(back - @as(f64, x));
-            // E4M3 has three mantissa bits: nearest-even is within 2^-4 of a normal value, and the subnormals'
-            // 2^-9 step bounds the rest (a row scaled to absmax = 448 never reaches them).
-            const bound = @as(f64, @abs(x)) * 0x1p-4 + 0x1p-9 + @as(f64, scale) * 0x1p-10;
-            try std.testing.expect(err <= bound);
+            // E4M3 has three mantissa bits: nearest-even is within 2^-4 of a normal value, and below 2^-6 the
+            // subnormals' step of scale * 2^-9 bounds the rest.
+            try std.testing.expect(err <= @as(f64, @abs(x)) * 0x1p-4 + @as(f64, scale) * 0x1p-9 + 1e-30);
             if (x != 0) {
-                worst = @max(worst, err / @abs(@as(f64, x)));
                 sum += err * err;
+                if (@abs(x) >= scale * 0x1p-6) worst = @max(worst, err / @abs(@as(f64, x)));
             }
         }
     }
-    // The format's relative RMS is ~2.6 % (the plan's proxy: E4M3 2.6 % against the fork's Q8 0.54 %).
+    // The format's relative RMS is ~2.6 % (the plan's proxy: E4M3 2.6 % against the fork's Q8 0.54 %), and its
+    // nearest-even grid caps a normal value at 2^-4.
     const rms = @sqrt(sum / @as(f64, @floatFromInt(64 * m.latent)));
-    try std.testing.expect(worst <= 0x1p-4 + 0x1p-9 / 0.25 and worst > 0.05);
+    try std.testing.expect(worst <= 0x1p-4 and worst > 0.03);
     try std.testing.expect(rms > 0.005 and rms < 0.05);
 }
 
@@ -98,7 +99,7 @@ test "the E4M3 row saturates and refuses what the device refuses" {
     try std.testing.expectEqual(@as(f32, 1), scale);
     try std.testing.expectEqual(@as(u8, 0x7e), codes[0]); // E4M3 448
     try std.testing.expectEqual(@as(u8, 0xfe), codes[1]);
-    try std.testing.expectEqual(@as(u8, 0x5e), codes[2]); // E4M3 224
+    try std.testing.expectEqual(@as(u8, 0x76), codes[2]); // E4M3 224
     try std.testing.expectEqual(@as(u8, 0x00), codes[3]);
     // A tiny row keeps a finite scale (2^-126's floor) instead of dividing by zero.
     const tiny = try pack(&.{ 1e-40, 0 }, codes[0..2]);

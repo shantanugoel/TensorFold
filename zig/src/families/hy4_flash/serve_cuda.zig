@@ -7,7 +7,7 @@ const dfly = @import("cuda_draft.zig");
 const geom = @import("cuda_scratch.zig");
 const mla = @import("mla_weights.zig");
 const cuda_vision = @import("cuda_vision.zig");
-const kv8 = @import("cuda_kv8.zig");
+const format = @import("cuda_kv8.zig");
 const be = lanes.backend;
 
 /// A prompt chunk's rows: the dev binary's cap and the model's `max_rows`.
@@ -42,7 +42,7 @@ pub fn cacheBytes(m: *const model.Model) Bytes {
         if (layer.attention.sliding)
             b.ring += @as(u64, layer.attention.rows) * mla.absorbed_stride * 2
         else
-            b.kv += @as(u64, layer.attention.rows) * kv8.rowBytes(m.kv8);
+            b.kv += @as(u64, layer.attention.rows) * format.rowBytes(m.kv8);
         if (layer.attention.index) |ix| b.index += ix.token_keys.len + ix.group_keys.len;
     }
     b.scores = m.index.scoreBytes();
