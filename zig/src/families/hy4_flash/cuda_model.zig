@@ -240,13 +240,16 @@ pub const Model = struct {
     }
 
     /// `runs`: one pass over several sequences' rows, each run appended at its own history's end, its rows from `at`.
+    /// A sequence is one run: two runs for one slot would append its tokens twice, the second at a start the first moved.
     pub fn passRuns(self: *Model, runs: []const geom.Run, logits_out: []f32, rows_out: ?Rows) !void {
         if (runs.len == 0 or runs.len > geom.max_slots) return error.BadHy4PassRows;
         var rows: usize = 0;
         var first: [geom.max_slots]usize = undefined; // each run's first pass row
         var starts: [geom.max_slots]usize = undefined; // and its first position in its own sequence
+        var used: [geom.max_slots]bool = @splat(false); // one run a sequence, or its rows would append twice
         for (runs, 0..) |run, i| {
-            if (run.slot >= self.slots) return error.BadHy4PassRows;
+            if (run.slot >= self.slots or used[run.slot]) return error.BadHy4PassRows;
+            used[run.slot] = true;
             const start = self.history[run.slot].items.len;
             if (run.tokens.len == 0 or start + run.tokens.len > self.capacity) return error.BadHy4PassRows;
             first[i] = rows;
@@ -559,3 +562,23 @@ fn inside(whole: []const f32, part: []const f32) bool {
         try s.synchronize();
     }
 };
+
+test "a pass takes one run a sequence: a second run for a slot is refused before any row is appended" {
+    const a = std.testing.allocator;
+    const hists = try a.alloc(std.ArrayList(u32), 2);
+    defer a.free(hists);
+    hists[0] = .empty;
+    hists[1] = .empty;
+    var mdl: Model = undefined;
+    mdl.slots = 2;
+    mdl.capacity = 4096;
+    mdl.max_rows = 1024;
+    mdl.history = hists;
+    var logits: [1]f32 = .{0};
+    const two = [_]u32{ 7, 8 };
+    // One run a sequence is the shape a shared round has: each sequence's rows appended at its own end.
+    try std.testing.expectError(error.BadHy4PassRows, mdl.passRuns(&.{ .{ .slot = 0, .tokens = &two }, .{ .slot = 0, .tokens = &two } }, &logits, null));
+    try std.testing.expectEqual(@as(usize, 0), hists[0].items.len); // refused before the first append
+    try std.testing.expectError(error.BadHy4PassRows, mdl.passRuns(&.{ .{ .slot = 2, .tokens = &two } }, &logits, null));
+    try std.testing.expectError(error.BadHy4PassRows, mdl.passRuns(&[_]geom.Run{}, &logits, null));
+}
