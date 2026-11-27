@@ -228,6 +228,36 @@ test "a plan refuses an image whose rows do not match its grid, and one that ove
     try std.testing.expectError(error.BadHy4VisionPlan, Plan.build(a, &.{.{ .at = 0, .tokens = 6, .gh = 3, .gw = 4, .hash = 1 }}, 8));
 }
 
+/// The Engram media mask a pass writes: 1 on a row the tower filled (the branch leaves its residual alone), 0 on a
+/// text row. The kernel reads the mask row on every pass, so a vision-loaded model writes it on every pass — a text
+/// pass after an image pass must hand the scratch all zeros (`cuda_model.passRuns`).
+pub fn mediaMask(sources: []const i32, out: []u32) void {
+    std.debug.assert(out.len >= sources.len);
+    for (sources, out[0..sources.len]) |src, *keep| keep.* = @intFromBool(src >= 0);
+}
+
+test "a text pass after an image pass writes the media mask all zero" {
+    const a = std.testing.allocator;
+    // One 4x4-patch image at row 1 of a 10-row prompt: rows 1..6 read the tower, and text follows.
+    var plan = try Plan.build(a, &.{.{ .at = 1, .tokens = 6, .gh = 4, .gw = 4, .hash = 3 }}, 10);
+    defer plan.deinit();
+    var sources: [4]i32 = undefined;
+    var positions: [12]i32 = undefined;
+    var media: [4]u32 = undefined;
+    // The pass that holds the image: the mask is 1 on its rows alone, and a text row keeps 0.
+    plan.fill(1, 4, &positions, &sources);
+    mediaMask(&sources, &media);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1 }, &media);
+    plan.fill(0, 4, &positions, &sources);
+    mediaMask(&sources, &media);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 1 }, &media);
+    // The next pass is text only (a drafting verify row, another lane's prompt, a later chunk): the same buffer, and
+    // the mask the scratch still held is all zero.
+    @memset(&sources, -1);
+    mediaMask(&sources, &media);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, &media);
+}
+
 /// One tower layer's device weights.
 pub const Layer = struct {
     ln1: u64,

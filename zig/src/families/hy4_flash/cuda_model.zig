@@ -365,7 +365,6 @@ pub const Model = struct {
         defer pass_a.free(sources);
         const positions = try pass_a.alloc(i32, rows * 3);
         defer pass_a.free(positions);
-        var any_image = false;
         for (0..rows) |r| {
             const im = self.imagesOf(row_slot[r]) orelse {
                 sources[r] = -1;
@@ -373,7 +372,6 @@ pub const Model = struct {
             };
             sources[r] = im.plan.featureRow(row_pos[r]);
             positions[r * 3 ..][0..3].* = im.plan.positionAt(row_pos[r]);
-            any_image = any_image or sources[r] >= 0;
             // The indexer rotates a group's key by its first token's position: write the plane as those rows pass.
             if (row_pos[r] % @import("index_groups.zig").slots == 0) {
                 const g = row_pos[r] / @import("index_groups.zig").slots;
@@ -402,11 +400,13 @@ pub const Model = struct {
             // Sliding layers read and write the ring's slots; with the ring off they keep their position's row.
             ring_writes[r] = @intCast(self.ringBase(row_slot[r]) + if (self.ring) geom.ring.slot(row_pos[r]) else row_pos[r]);
         }
-        // The Engram branch leaves an image row's residual alone (the reference's media mask).
-        if (any_image) {
+        // The Engram branch leaves an image row's residual alone (the reference's media mask), and the kernel reads a
+        // row of the mask on every pass. A vision-loaded model therefore writes it every pass — a text pass after an
+        // image pass clears the 1s the image left, instead of inheriting them into its own rows.
+        if (self.vision != null) {
             const media = try pass_a.alloc(u32, rows);
             defer pass_a.free(media);
-            for (media, sources) |*keep, src| keep.* = @intFromBool(src >= 0);
+            cuda_vision.mediaMask(sources, media);
             try (cuda.DeviceBuffer{ .d = self.d, .ptr = sc.media, .len = rows * 4, .borrowed = true }).uploadAsync(0, std.mem.sliceAsBytes(media), s.handle);
         }
         try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(positions), s.handle);
