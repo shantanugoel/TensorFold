@@ -129,12 +129,23 @@ pub const Call = struct {
     rope: rope.Parameters,
     q_rank: usize,
     hidden_size: usize,
+    /// One a set: the 3-D position of each of that sequence's groups' first tokens (`RowSet` order). Null: a text-only
+    /// pass, where a group's first token is at its own slot and the arithmetic below is that exactly.
+    group_planes: ?[]const []const i32 = null,
+
+    /// The group-position plane of the set in `slot`, when this pass has one for it.
+    fn planeOf(c: Call, slot: usize) ?[]const i32 {
+        const planes = c.group_planes orelse return null;
+        for (c.sets, planes) |set, plane| if (set.slot == slot) return if (plane.len == 0) null else plane;
+        return null;
+    }
 };
 
 pub fn forward(c: Call) !void {
     const sc = c.scratch;
     const s = c.s;
     if (c.sets.len == 0 or c.rows == 0 or c.rows > sc.gemm_rows) return error.BadHy4IndexRows;
+    if (c.group_planes) |planes| if (planes.len != c.sets.len) return error.BadHy4IndexRows;
     for (c.sets) |set| {
         if (set.rows == 0 or set.row0 + set.rows > c.rows or set.first + set.rows > c.layer.capacity)
             return error.Hy4IndexPastCapacity;
@@ -157,7 +168,11 @@ pub fn forward(c: Call) !void {
         if (closed.new_groups == 0) continue;
         const first_group = set.slot * groups_of(c.layer.capacity) + closed.first_group;
         var pos: [3 * (geom.row_cap / groups.slots + 2)]i32 = undefined;
-        for (0..closed.new_groups) |g| pos[g * 3 ..][0..3].* = @splat(@intCast((closed.first_group + g) * groups.slots));
+        for (0..closed.new_groups) |g| {
+            if (c.planeOf(set.slot)) |plane| {
+                @memcpy(pos[g * 3 ..][0..3], plane[(closed.first_group + g) * 3 ..][0..3]);
+            } else pos[g * 3 ..][0..3].* = @splat(@intCast((closed.first_group + g) * groups.slots));
+        }
         try sc.group_positions.uploadAsync(0, std.mem.sliceAsBytes(pos[0 .. closed.new_groups * 3]), s.handle);
         try c.indexer.poolGroups(s, c.project, c.layer.w, c.layer.token_keys.ptr, c.layer.group_keys.ptr, @intCast(first_group), @intCast(closed.new_groups), sc.group_positions.ptr, sc.group_table, c.rope, c.epsilon);
     }

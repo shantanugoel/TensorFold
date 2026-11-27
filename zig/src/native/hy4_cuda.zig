@@ -79,9 +79,9 @@ fn memory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     return .{ .active = u.device, .cache = 0, .peak = u.peak, .pinned = u.host };
 }
 
-/// Words for a request this engine cannot serve yet: images are the vision step, tools are not served.
+/// Words for a request this engine cannot serve yet: images need the tower, tools are not served.
 fn refusalMessage(_: *anyopaque, request: *const api.Request, out: []u8) ?[]const u8 {
-    if (request.images.len > 0) return put(out, "the Hy4-flash CUDA engine reads text only for now: send the request without image parts");
+    if (request.images.len > 0) return put(out, "the Hy4-flash CUDA engine reads text only on this server: start it with --vision to send image parts");
     if (request.tools_json.len > 0) return put(out, "the Hy4-flash CUDA engine does not serve tools yet: send the request without tools");
     return null;
 }
@@ -100,7 +100,11 @@ fn refuse(a: Allocator, problem: *[]const u8, comptime fmt: []const u8, args: an
 
 /// The flags this engine's path cannot serve yet, each with the step that brings it; null when they are all absent.
 fn refusal(a: Allocator, o: api.Open) !?[]const u8 {
-    if (o.vision != null) return try std.fmt.allocPrint(a, "--vision: the native Hy4-flash engine reads text only; the width's tower is plan step 7.9, so serve without --vision", .{});
+    if (o.vision) |v| {
+        // One image's rows are the tower's; a request may hold `max_images` of them (the family's own limit).
+        if (v.image_tokens > family.vision_token_limit) return try std.fmt.allocPrint(a, "--vision-image-tokens {d}: one image may take {d} tokens at most (four patches a token is the tower's scratch)", .{ v.image_tokens, family.vision_token_limit });
+        if (v.video_tokens > 0 and v.max_videos > 0) return try std.fmt.allocPrint(a, "--vision: the Hy4-flash engine reads images and no video yet: the reference's video path is not ported", .{});
+    }
     if (o.lanes < 1 or o.lanes > family.max_slots) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves 1 to {d} sequences", .{ o.lanes, family.max_slots });
     if (o.tp != 1 or o.rank != 0) return try std.fmt.allocPrint(a, "--tp {d} --rank {d}: the native Hy4-flash engine is one device (1 and 0)", .{ o.tp, o.rank });
     if (o.kv8) return try std.fmt.allocPrint(a, "--kv-cache fp8: this engine's caches are BF16; 8-bit KV is plan step 7.7", .{});
@@ -175,7 +179,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const draft_lanes = @import("sys").environment.read(u32, "TF_HY4_DRAFT_LANES", 2) catch 2;
     const drafts = loadDrafts(o.lanes, draft_lanes, asked);
     if (asked > 0 and drafts == 0) std.log.info("hy4-cuda: --mtp-drafts {d} not loaded: a --parallel {d} server serves the plain path (a resident tower costs a shared pass about 10 %, step 6c; use --parallel 1, or TF_HY4_DRAFT_LANES=3 to draft in a two-lane round)", .{ asked, o.lanes });
-    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
+    const vision_tokens: u32 = if (o.vision) |v| v.image_tokens else 0;
+    h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes, vision_tokens) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
     const bytes = h.c.bytes();
@@ -204,12 +209,13 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.c.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.startup = try std.fmt.allocPrint(gpa, "CUDA device {d}: Hy4-flash {d}-token context x {d} sequences ({d:.2} GiB KV + {d:.2} GiB indexer keys + {d:.0} MiB ring + {d:.0} MiB recall scores), {d:.2} GiB weights, {d:.1} GiB free after the load, DFly2 {s}", .{
+    h.startup = try std.fmt.allocPrint(gpa, "CUDA device {d}: Hy4-flash {d}-token context x {d} sequences ({d:.2} GiB KV + {d:.2} GiB indexer keys + {d:.0} MiB ring + {d:.0} MiB recall scores), {d:.2} GiB weights, {d:.1} GiB free after the load, DFly2 {s}, images {s}", .{
         device,                       family.Cuda.served(h.c),     o.lanes,
         gib(bytes.kv),                gib(bytes.index),
         @as(f64, @floatFromInt(bytes.ring)) / (1 << 20), @as(f64, @floatFromInt(bytes.scores)) / (1 << 20),
         gib(h.c.m.weight_bytes),      gib(avail),
         if (h.c.m.draft != null) "on" else "off",
+        if (o.vision) |v| try std.fmt.allocPrint(a, "on ({d} tokens an image)", .{v.image_tokens}) else "off",
     });
     errdefer gpa.free(h.startup);
     h.host = api.LaneHost.init(gpa, io, &h.core, .{
@@ -223,6 +229,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         .policy = "Hy4-flash CUDA: dense EXL3 groups, BF16 elsewhere, the sliding layers' 1,536-slot ring, one sequence a lane",
         .startup = h.startup,
     });
+    // --vision: the tower's processor behind the server's image expansion (it writes the prompt's placeholders).
+    if (o.vision != null) h.host.info_.vision = @import("cuda_vision_offer.zig").offer(&h.c.vision, o.vision);
     h.host.on_thread = .{ .ctx = h, .run = bindThread };
     h.host.health = .{ .ctx = h, .read = healthy };
     h.host.memory = .{ .ctx = null, .read = memory };

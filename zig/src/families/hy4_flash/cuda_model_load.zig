@@ -156,8 +156,16 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         const dr = self.draft.?;
         std.debug.print("DFly2 drafter: {d} layers of {d}, a block of {d} rows\n", .{ dr.layers.len, dr.inner, dfly.width });
     }
+    // The image tower after everything else, for the same reason: a load without --vision allocates nothing more.
+    if (o.vision) {
+        try self.loadVision(dir, o.vision_tokens);
+        ck.release();
+        const tower = self.vision.?;
+        std.debug.print("image tower: {d} layers, {d:.2} GiB of weights and {d:.0} MiB of scratch for {d} patches an image\n", .{ tower.layers.len, @as(f64, @floatFromInt(tower.bytes)) / (1 << 30), @as(f64, @floatFromInt(tower.scratch.patches.len + tower.scratch.pos.len + tower.scratch.attention.len)) / (1 << 20), tower.patches_max });
+        self.weight_bytes = self.own.bytes;
+    }
     // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor
-    try @import("loader.zig").finishCuda(ck, cfg.value, self.draft != null);
+    try @import("loader.zig").finishCuda(ck, cfg.value, self.draft != null, o.vision);
     // What grows with the context, so a size decision is read and not inferred: KV, indexer keys, recall scores.
     var kv_bytes: usize = 0;
     var index_bytes: usize = 0;

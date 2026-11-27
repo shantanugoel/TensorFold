@@ -16,6 +16,7 @@ const direct = @import("bf16_rows.zig");
 const engram_pass = @import("engram_pass.zig");
 const geom = @import("cuda_scratch.zig");
 const cuda_index = @import("cuda_index.zig");
+const cuda_vision = @import("cuda_vision.zig");
 const dfly = @import("cuda_draft.zig");
 
 const H = geom.H;
@@ -33,6 +34,10 @@ const engram_readers = 8;
 
 pub const Kernels = struct {
     gemm: cuda.vit.Gemms,
+    /// The vision tower's glue (LayerNorm, GELUs, pixel unshuffle) and its frame attention: loaded always, read by
+    /// `--vision` only.
+    vision_glue: cuda.vit.Kernels,
+    pixels: cuda.vit.Attention,
     norms: cuda.norms.Norms,
     project: mla.Projections,
     attention: mla.Attention,
@@ -57,6 +62,8 @@ pub const Kernels = struct {
         self.ihc.deinit();
         self.attention.deinit();
         self.project.deinit();
+        self.pixels.unload();
+        self.vision_glue.unload();
         self.norms.unload();
         self.gemm.deinit();
         self.* = undefined;
@@ -66,6 +73,8 @@ pub const Kernels = struct {
     pub fn load(a: std.mem.Allocator, d: *const cuda.Driver) !Kernels {
         return .{
             .gemm = try cuda.vit.Gemms.init(a, d),
+            .vision_glue = try cuda.vit.Kernels.load(d),
+            .pixels = try cuda.vit.Attention.load(d),
             .norms = try cuda.norms.Norms.load(d),
             .project = try mla.Projections.load(d),
             .attention = try mla.Attention.load(d),
@@ -168,6 +177,9 @@ pub const Model = struct {
     engram_ns: i96 = 0,
     /// The pack's DFly2 drafter, when a round holds drafts: `cuda_draft.zig`, and null on the one-row path.
     draft: ?dfly.Draft = null,
+    /// The image tower (`--vision`), and a sequence's prompt images: null and empty without it (`cuda_vision.zig`).
+    vision: ?*cuda_vision.Tower = null,
+    images: []?Images = &.{},
     /// A row's four streams after every layer, for the row-count check: does this row depend on its pass's width.
     trace: ?Trace = null,
 
@@ -186,7 +198,60 @@ pub const Model = struct {
         ring: bool = true,
         drafts: u32 = 0,
         slots: usize = 1,
+        /// `--vision`: load the image tower, for images of at most `vision_tokens` LM tokens.
+        vision: bool = false,
+        vision_tokens: u32 = 0,
     };
+
+    /// A sequence's prompt images: the rows the tower encoded for it, and the positions and Engram mask they impose.
+    pub const Images = struct {
+        plan: cuda_vision.Plan,
+        rows: cuda.DeviceBuffer,
+        /// One row a group: the 3-D position of the token a group starts at, which the indexer rotates its keys by.
+        groups: []i32,
+    };
+
+    /// The images `slot` holds, when its prompt has any.
+    pub fn imagesOf(self: *Model, slot: usize) ?*Images {
+        if (slot >= self.images.len) return null;
+        return if (self.images[slot]) |*im| im else null;
+    }
+
+    /// Plans `slot`'s prompt images and the rows they read: the caller encodes each into `rows` at its span's `base`.
+    /// The tower rows stay until the plan is replaced, so a chunked fill reads its image rows across passes.
+    pub fn setImages(self: *Model, slot: usize, inputs: []const cuda_vision.Input, prompt_len: usize) !void {
+        if (self.vision == null or slot >= self.images.len) return error.BadHy4VisionSlot;
+        self.clearImages(slot);
+        const plan = try cuda_vision.Plan.build(self.a, inputs, prompt_len);
+        errdefer {
+            var p = plan;
+            p.deinit();
+        }
+        const rows = try cuda.DeviceBuffer.alloc(self.d, @max(plan.rows, 1) * H * 2);
+        errdefer rows.free();
+        const groups = try self.a.alloc(i32, cuda_index.groups_of(self.capacity) * 3);
+        @memset(groups, 0);
+        self.images[slot] = .{ .plan = plan, .rows = rows, .groups = groups };
+    }
+
+    pub fn clearImages(self: *Model, slot: usize) void {
+        if (slot >= self.images.len) return;
+        if (self.images[slot]) |*im| {
+            im.rows.free();
+            self.a.free(im.groups);
+            im.plan.deinit();
+            self.images[slot] = null;
+        }
+    }
+
+    /// Loads the tower for images of at most `tokens` LM tokens: after the layers, so the text path's addresses are the
+    /// ones a load without `--vision` gives them.
+    pub fn loadVision(self: *Model, dir: []const u8, image_tokens: u32) !void {
+        const cfg = (try cuda_vision.vc.Config.read(self.a, self.io, dir)) orelse return error.NoHy4VisionConfig;
+        self.images = try self.a.alloc(?Images, self.slots);
+        for (self.images) |*im| im.* = null;
+        self.vision = try cuda_vision.Tower.load(self.a, self.d, self.s, &self.k.gemm, &self.k.vision_glue, &self.k.pixels, &self.k.norms, self.ck, &self.own, cfg, image_tokens);
+    }
 
     /// A sequence's first slot in an indexed layer's cache, and in a sliding layer's ring.
     pub fn seqBase(self: *const Model, slot: usize) usize {
@@ -285,25 +350,54 @@ pub const Model = struct {
         const s = self.s;
         const k = self.k;
         const eps = self.text.rms_norm_eps;
-        // Embedding into four identical streams.
-        var x = sc.streams[0].ptr;
-        for (row_tok, 0..) |tok, r| for (0..S) |st| {
-            try sc.streams[0].copyFrom((r * S + st) * H * 2, self.embed + @as(u64, tok) * H * 2, H * 2, s.handle);
-        };
-        // Positions (text: t = h = w), write slots and key lists for both attention kinds.
+        // A row's own image, when its sequence's prompt holds one: its tower row, its 3-D position, its Engram mask.
+        const sources = try pass_a.alloc(i32, rows);
+        defer pass_a.free(sources);
         const positions = try pass_a.alloc(i32, rows * 3);
         defer pass_a.free(positions);
+        var any_image = false;
+        for (0..rows) |r| {
+            const im = self.imagesOf(row_slot[r]) orelse {
+                sources[r] = -1;
+                continue;
+            };
+            sources[r] = im.plan.featureRow(row_pos[r]);
+            positions[r * 3 ..][0..3].* = im.plan.positionAt(row_pos[r]);
+            any_image = any_image or sources[r] >= 0;
+            // The indexer rotates a group's key by its first token's position: write the plane as those rows pass.
+            if (row_pos[r] % @import("index_groups.zig").slots == 0) {
+                const g = row_pos[r] / @import("index_groups.zig").slots;
+                @memcpy(im.groups[g * 3 ..][0..3], positions[r * 3 ..][0..3]);
+            }
+        }
+        // Embedding into four identical streams: an image row takes the tower's row, every other its token's.
+        var x = sc.streams[0].ptr;
+        for (row_tok, 0..) |tok, r| {
+            const src = if (sources[r] < 0) self.embed + @as(u64, tok) * H * 2 else source: {
+                const im = self.imagesOf(row_slot[r]) orelse return error.BadHy4VisionSlot;
+                break :source im.rows.ptr + @as(u64, @intCast(sources[r])) * H * 2;
+            };
+            for (0..S) |st| try sc.streams[0].copyFrom((r * S + st) * H * 2, src, H * 2, s.handle);
+        }
+        // Positions (text: t = h = w), write slots and key lists for both attention kinds.
         const writes = try pass_a.alloc(u32, rows);
         defer pass_a.free(writes);
         const ring_writes = try pass_a.alloc(u32, rows);
         defer pass_a.free(ring_writes);
         for (0..rows) |r| {
             const p: i32 = @intCast(row_pos[r]);
-            positions[r * 3 ..][0..3].* = .{ p, p, p };
+            if (self.imagesOf(row_slot[r]) == null) positions[r * 3 ..][0..3].* = .{ p, p, p };
             // An indexed layer's cache is every sequence's in turn; a sliding layer's ring the same.
             writes[r] = @intCast(self.seqBase(row_slot[r]) + row_pos[r]);
             // Sliding layers read and write the ring's slots; with the ring off they keep their position's row.
             ring_writes[r] = @intCast(self.ringBase(row_slot[r]) + if (self.ring) geom.ring.slot(row_pos[r]) else row_pos[r]);
+        }
+        // The Engram branch leaves an image row's residual alone (the reference's media mask).
+        if (any_image) {
+            const media = try pass_a.alloc(u32, rows);
+            defer pass_a.free(media);
+            for (media, sources) |*keep, src| keep.* = @intFromBool(src >= 0);
+            try (cuda.DeviceBuffer{ .d = self.d, .ptr = sc.media, .len = rows * 4, .borrowed = true }).uploadAsync(0, std.mem.sliceAsBytes(media), s.handle);
         }
         try sc.positions.uploadAsync(0, std.mem.sliceAsBytes(positions), s.handle);
         try sc.write_slots.uploadAsync(0, std.mem.sliceAsBytes(writes), s.handle);
@@ -357,6 +451,13 @@ pub const Model = struct {
         };
         var sets: [geom.max_slots]cuda_index.RowSet = undefined;
         for (runs, 0..) |run, i| sets[i] = .{ .slot = run.slot, .first = starts[i], .rows = run.tokens.len, .row0 = first[i], .select = selecting[i] };
+        // A sequence with images ranks its groups by their first token's own position, not by the token's slot.
+        var planes: [geom.max_slots][]const i32 = @splat(&.{});
+        var any_plane = false;
+        for (runs, 0..) |run, i| if (self.imagesOf(run.slot)) |im| {
+            planes[i] = im.groups;
+            any_plane = true;
+        };
         const rope_sparse = try self.text.rotary(.deepseek_sparse_attention);
         var slot: usize = 0; // index of the stream buffer x lives in
         for (self.layers, 0..) |*layer, layer_index| {
@@ -404,7 +505,8 @@ pub const Model = struct {
                     .s = s, .indexer = &k.indexer, .gemms = &k.gemm, .norms = &k.norms, .project = k.project,
                     .scratch = &self.index, .layer = ix, .hidden = sc.hidden, .q_resid = sc.q_resid,
                     .positions = sc.positions.ptr, .table = sc.table, .slots = sc.slots.ptr, .counts = sc.counts.ptr,
-                    .sets = sets[0..runs.len], .rows = rows, .epsilon = eps, .rope = rope_sparse, .q_rank = Q,
+                    .sets = sets[0..runs.len], .group_planes = if (any_plane) planes[0..runs.len] else null,
+                    .rows = rows, .epsilon = eps, .rope = rope_sparse, .q_rank = Q,
                     .hidden_size = H,
                 });
                 if (self.draft) |*dr| for (sets[0..runs.len]) |set| {
@@ -505,6 +607,10 @@ fn inside(whole: []const f32, part: []const f32) bool {
 /// The caches, the pass's scratch, the Engram tables and the weights, released before the context is.
     pub fn free(self: *Model) void {
         if (self.draft) |*dr| dfly.free(self.a, dr);
+        // The tower's weights live in the upload table, so the tower goes before it; its rows are the plans'.
+        for (0..self.images.len) |i| self.clearImages(i);
+        if (self.images.len > 0) self.a.free(self.images);
+        if (self.vision) |v| v.deinit();
         for (self.layers) |*layer| {
             layer.attention.cache.free();
             if (layer.attention.index) |ix| {

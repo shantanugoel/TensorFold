@@ -6,6 +6,7 @@ const model = @import("cuda_model.zig");
 const dfly = @import("cuda_draft.zig");
 const geom = @import("cuda_scratch.zig");
 const mla = @import("mla_weights.zig");
+const cuda_vision = @import("cuda_vision.zig");
 const be = lanes.backend;
 
 /// A prompt chunk's rows: the dev binary's cap and the model's `max_rows`.
@@ -19,6 +20,8 @@ pub const max_slots: usize = geom.max_slots;
 /// A verify window's rows: the pending row and DFly2's five drafts, and the drafts a round proposes.
 pub const max_window: u32 = dfly.width;
 pub const drafts: u32 = dfly.drafts;
+/// `--vision-image-tokens`'s ceiling: one image's LM tokens, the width's tower's own limit.
+pub const vision_token_limit: u32 = cuda_vision.token_limit;
 /// The sliding layers' ring: a rewind may read back only what the ring still holds.
 const ring_rows: u32 = geom.ring.rows;
 const ring_window: u32 = geom.ring.window;
@@ -77,8 +80,40 @@ const Seq = struct {
     /// own width names, and `keep` cuts the history by what the pass really wrote. 0: the round ended this stream.
     ran: u32 = 0,
     /// The drafts the last block proposed for this sequence: 0 where the block was skipped, so a held row that is
-    /// only a repeat is neither proposed nor kept in the counters.
+    /// only a repeat is neither proposed nor kept.
     proposed: u32 = 0,
+    /// The image plan the caches were filled under (`cuda_vision.hashOf`): 0 for a prompt without images, so a kept
+    /// prefix is resumed only under the same plan — an image's rows carry its own 3-axis positions.
+    plan_hash: u64 = 0,
+};
+
+/// The image offer the server expands a prompt's placeholders with (`--vision`): the checkpoint's own processor, its
+/// markers, and what a request may hold. The template writes `<|image_start|><|image_pad|><|image_end|>` itself, so the
+/// server expands the pad token alone.
+pub const Vision = struct {
+    pub const template_wraps = true;
+    pub const part_type = "image_url";
+    io: std.Io,
+    cfg: cuda_vision.vc.Config,
+    /// `--vision`'s limits, an image's count capped by what the tower's scratch was sized for.
+    limits: cuda_vision.vc.Limits,
+    marks: struct { open: u32, image: u32, close: u32 },
+    mark_ids: [3]u32,
+
+    pub fn prepare(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) anyerror!@import("engine_api").PreparedImage {
+        const v: *Vision = @ptrCast(@alignCast(ctx));
+        const p = try cuda_vision.vc.prepare(v.io, a, bytes, v.cfg, @min(max_tokens, v.limits.image_tokens));
+        return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+    }
+
+    /// The processor's words for an image it cannot read; null for any other error (the server's own).
+    pub fn explain(err: anyerror) ?[]const u8 {
+        return switch (err) {
+            error.ImageTooSmall, error.Oversized, error.BadVisionLayout => "the image's size is outside what the vision tower reads (32 to 2048 pixels a side, under 200:1)",
+            error.NoDecoder, error.Invalid => "the image's bytes are not a JPEG or PNG this engine decodes",
+            else => null,
+        };
+    }
 };
 
 pub const Cuda = struct {
@@ -109,14 +144,17 @@ pub const Cuda = struct {
     draft_ns: i96 = 0,
     /// `TF_HY4_ROUND_LOG`: every round's window, its rows' draws and what it kept, on stderr.
     log_rounds: bool = false,
+    /// `--vision`: the tower is loaded and a prompt's images are planned and encoded.
+    vision: Vision = undefined,
 
     /// Loads the pack: `slots` sequences' caches of `capacity` positions, `prompt_rows` rows a pass, `drafts` a round.
-    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize) !*Cuda {
+    pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize, vision_tokens: u32) !*Cuda {
         // A sequence's cache must close on the indexer's four-slot group, or its pooled keys and recall lists overlap.
         if (!capacityFits(capacity, slots)) return error.Hy4UngroupedCapacity;
+        if (vision_tokens > cuda_vision.token_limit) return error.BadHy4VisionLimits;
         const self = try a.create(Cuda);
         errdefer a.destroy(self);
-        const m = try model.Model.open(a, io, d, s, k, dir, .{ .capacity = capacity, .max_rows = prompt_rows, .drafts = rounds, .slots = slots });
+        const m = try model.Model.open(a, io, d, s, k, dir, .{ .capacity = capacity, .max_rows = prompt_rows, .drafts = rounds, .slots = slots, .vision = vision_tokens > 0, .vision_tokens = vision_tokens });
         errdefer model.Model.free(m);
         const vocab: usize = m.text.vocab_size;
         // Every row a round can hold: the engine's batch width, which is this many sequences' windows at least.
@@ -140,6 +178,16 @@ pub const Cuda = struct {
             .batch_rows = rows,
             .log_rounds = @import("sys").environment.read(bool, "TF_HY4_ROUND_LOG", false) catch false,
         };
+        if (vision_tokens > 0) {
+            const cfg = (try cuda_vision.vc.Config.read(a, io, dir)) orelse return error.NoHy4VisionConfig;
+            self.vision = .{
+                .io = io,
+                .cfg = cfg,
+                .limits = .{ .image_tokens = vision_tokens, .max_images = cuda_vision.image_limit },
+                .marks = .{ .open = cfg.image_start, .image = cfg.image_token, .close = cfg.image_end },
+                .mark_ids = .{ cfg.image_start, cfg.image_token, cfg.image_end },
+            };
+        }
         return self;
     }
 
@@ -179,7 +227,8 @@ pub const Cuda = struct {
     /// A slot whose old request is gone: its facts go, its caches stay kept so the new prompt may resume on them.
     fn reclaim(self: *Cuda, slot: usize) void {
         const from = self.seq[slot].valid_from;
-        self.seq[slot] = .{ .kept = true, .valid_from = from };
+        const plan_hash = self.seq[slot].plan_hash;
+        self.seq[slot] = .{ .kept = true, .valid_from = from, .plan_hash = plan_hash };
     }
 
     /// A free slot for `s`, or NoFreeSlot: what it held stays, a kept prefix and the ring's high-water mark. The slot whose
@@ -200,15 +249,16 @@ pub const Cuda = struct {
         const q = &self.seq[i];
         const kept = q.kept;
         const from = q.valid_from;
-        q.* = .{ .stream = s, .kept = kept, .valid_from = from };
+        const plan_hash = q.plan_hash;
+        q.* = .{ .stream = s, .kept = kept, .valid_from = from, .plan_hash = plan_hash };
         return i;
     }
 
     /// A free slot for `s`, and the row its fill starts at: the kept prefix its caches still hold.
-    fn openFill(self: *Cuda, s: *lanes.Stream, ids: []const u32) !usize {
+    fn openFill(self: *Cuda, s: *lanes.Stream, ids: []const u32, plan_hash: u64) !usize {
         const i = try self.openSlot(s, ids);
         const q = &self.seq[i];
-        q.from = self.reuseFrom(i, ids);
+        q.from = self.reuseFrom(i, ids, plan_hash);
         s.cached = @intCast(q.from);
         q.at = q.from;
         s.fill_at.store(@intCast(q.at), .monotonic);
@@ -237,6 +287,30 @@ pub const Cuda = struct {
     pub fn bumpRows(self: *Cuda, slot: usize, rows: usize) void {
         const from = if (rows > ring_rows) rows - ring_rows else 0;
         self.seq[slot].valid_from = @max(self.seq[slot].valid_from, @as(u32, @intCast(from)));
+    }
+
+    /// A prompt's images planned and encoded into `slot`: the rows it reads, the positions it sits at. A fill that
+    /// resumes a kept prefix keeps the plan it was filled under, so the plan is replaced only for a different prompt.
+    pub fn setPlan(self: *Cuda, slot: usize, images: []const lanes.stream.Image, prompt_len: usize) !void {
+        const tower = self.m.vision orelse return error.NoHy4VisionTower;
+        const inputs = try std.heap.page_allocator.alloc(cuda_vision.Input, images.len);
+        defer std.heap.page_allocator.free(inputs);
+        for (images, inputs) |im, *in| in.* = .{ .at = im.at, .tokens = im.tokens, .gh = im.gh, .gw = im.gw, .hash = im.hash };
+        try self.m.setImages(slot, inputs, prompt_len);
+        const plan = &self.m.imagesOf(slot).?.plan;
+        for (images, plan.spans) |im, sp| {
+            if (im.tokens != sp.tokens) return error.BadHy4VisionPlan;
+            try tower.encode(im.pixels, im.gh, im.gw, self.m.imagesOf(slot).?.rows.ptr + sp.base * cuda_vision.H * 2);
+        }
+        self.seq[slot].plan_hash = plan.hash;
+    }
+
+    /// The images a prompt carries, hashed with their places: what a kept prefix must share to be resumed.
+    fn planHash(images: []const lanes.stream.Image, prompt_len: usize) u64 {
+        var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+        h.update(std.mem.asBytes(&prompt_len));
+        for (images) |im| h.update(std.mem.asBytes(&[_]u64{ im.hash, im.at, im.tokens }));
+        return h.final();
     }
 
     /// `tokens` at the sequence's caches' end: the model's pass, then the ring's bookkeeping and the timers.
@@ -448,7 +522,7 @@ pub const Cuda = struct {
     pub fn fillIds(self: *Cuda, ids: []const u32) !usize {
         if (ids.len == 0) return error.EmptyHy4Prompt;
         if (ids.len > self.serve_cap) return error.Hy4ContextFull;
-        const from = self.reuseFrom(0, ids);
+        const from = self.reuseFrom(0, ids, 0);
         var at = from;
         while (at < ids.len) {
             const end = @min(ids.len, at + prompt_rows);
@@ -471,8 +545,17 @@ pub const Cuda = struct {
         // is still what the slot filled, and otherwise it goes back to the free list with its caches kept.
         const held = self.slotOf(s);
         if (held) |i| if (!self.owns(i, ids)) self.reclaim(i);
-        const slot = if (held) |i| if (self.seq[i].stream == s) i else try self.openFill(s, ids) else try self.openFill(s, ids);
+        // The prompt's images: their plan is what its rows read, so a fill decides it before it writes anything.
+        const images = s.images;
+        const inputs = try std.heap.page_allocator.alloc(cuda_vision.Input, images.len);
+        defer std.heap.page_allocator.free(inputs);
+        for (images, inputs) |im, *in| in.* = .{ .at = im.at, .tokens = im.tokens, .gh = im.gh, .gw = im.gw, .hash = im.hash };
+        const plan_hash: u64 = if (images.len == 0) 0 else cuda_vision.hashOf(inputs, ids.len);
+        const slot = if (held) |i| if (self.seq[i].stream == s) i else try self.openFill(s, ids, plan_hash) else try self.openFill(s, ids, plan_hash);
         const q = &self.seq[slot];
+        if (images.len > 0) {
+            if (q.plan_hash != plan_hash or self.m.imagesOf(slot) == null) try self.setPlan(slot, images, ids.len) else q.plan_hash = plan_hash;
+        } else if (self.m.imagesOf(slot) != null) self.m.clearImages(slot);
         if (q.at >= ids.len) return true;
         if (s.isCancelled()) {
             s.keepInterruptedPrefill(@intCast(q.at));
@@ -496,17 +579,26 @@ pub const Cuda = struct {
         s.keepInterruptedPrefill(@intCast(self.seq[slot].at));
     }
 
-    /// The row a fill starts at: the kept shared prefix, when it is long enough and the ring still holds its first row.
-    pub fn reuseFrom(self: *Cuda, slot: usize, ids: []const u32) usize {
+    /// The row a fill starts at: the kept shared prefix, when it is long enough, the ring still holds its first row, and
+    /// it was filled under the same image plan.
+    pub fn reuseFrom(self: *Cuda, slot: usize, ids: []const u32, plan_hash: u64) usize {
         var from: usize = 0;
-        if (self.seq[slot].kept and ids.len > 0) {
-            const same = sharedPrefix(self.m.tokens(slot), ids);
-            if (same >= keep_prefix and self.mayRewind(slot, @intCast(same))) from = same;
-            self.seq[slot].kept = false;
+        const q = &self.seq[slot];
+        if (q.kept and ids.len > 0) {
+            if (q.plan_hash == plan_hash) {
+                const same = sharedPrefix(self.m.tokens(slot), ids);
+                if (same >= keep_prefix and self.mayRewind(slot, @intCast(same))) from = same;
+            }
+            q.kept = false;
+        }
+        if (q.plan_hash != plan_hash) {
+            // Another prompt's images: the rows behind the old plan are unreadable, and the tower's are for its rows.
+            self.m.clearImages(slot);
+            q.plan_hash = plan_hash;
         }
         if (self.m.len(slot) != from) {
             self.m.cut(slot, from);
-            if (from == 0) self.seq[slot].valid_from = 0;
+            if (from == 0) q.valid_from = 0;
         }
         return from;
     }
@@ -552,7 +644,7 @@ pub const Cuda = struct {
         const self = cast(ptr);
         const slot = self.slotOf(s) orelse return;
         if (!self.owns(slot, s.prompt())) return; // the address came back with another request: not this slot's
-        self.seq[slot] = .{ .kept = true, .valid_from = self.seq[slot].valid_from };
+        self.seq[slot] = .{ .kept = true, .valid_from = self.seq[slot].valid_from, .plan_hash = self.seq[slot].plan_hash };
     }
 };
 
@@ -805,7 +897,7 @@ test "a prompt resumes at its shared prefix only above the keep floor and inside
     prompt[1024] = 5;
     m.history[0] = .{ .items = hist[0..2048], .capacity = hist.len, .pointer_stability = .{} };
     c.seq[0] = .{ .kept = true, .valid_from = 2048 - ring_rows };
-    try std.testing.expectEqual(@as(usize, 1024), c.reuseFrom(0, &prompt));
+    try std.testing.expectEqual(@as(usize, 1024), c.reuseFrom(0, &prompt, 0));
     try std.testing.expect(!c.seq[0].kept); // one fill decides, and the caches are no longer kept
     try std.testing.expectEqual(@as(usize, 1024), m.len(0)); // the history is cut to the resume
     // The other sequence's history is untouched by the first sequence's resume.
@@ -814,12 +906,12 @@ test "a prompt resumes at its shared prefix only above the keep floor and inside
     // A 63-row prefix is below the floor: a shorter fill is not worth resuming, so the next prompt starts at row 0.
     m.history[0] = .{ .items = hist[0..63], .capacity = hist.len, .pointer_stability = .{} };
     c.seq[0] = .{ .kept = true, .valid_from = 0 };
-    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(0, &prompt));
+    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(0, &prompt, 0));
     try std.testing.expectEqual(@as(usize, 0), m.len(0));
 
     // A prefix the ring no longer holds: 300 rows into a 2,403-row fill, its first new row reads an overwritten slot.
     prompt[300] = 6;
     m.history[0] = .{ .items = hist[0..2403], .capacity = hist.len, .pointer_stability = .{} };
     c.seq[0] = .{ .kept = true, .valid_from = 2403 - ring_rows };
-    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(0, &prompt));
+    try std.testing.expectEqual(@as(usize, 0), c.reuseFrom(0, &prompt, 0));
 }

@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     defer s.deinit();
     var kernels = try family.Kernels.load(a, &driver);
     defer kernels.deinit();
-    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, 0, slots);
+    const c = try family.Cuda.init(a, io, &driver, s, &kernels, dir, capacity, 0, slots, 0);
     defer c.deinit();
     const b = c.backend();
     std.debug.print("loaded: {d}-slot context x {d} sequences, {d} layers\n", .{ capacity, slots, c.m.layers.len });
@@ -116,7 +116,7 @@ fn neighbour(c: *family.Cuda, a: std.mem.Allocator) !void {
     try c.pass(1, ids_b[0..3]);
     try c.pass(1, ids_b[3..515]);
     c.seq[1].kept = true;
-    const from = c.reuseFrom(1, ids_b);
+    const from = c.reuseFrom(1, ids_b, 0);
     if (from < 64) {
         std.debug.print("slot 1: the reuse did not engage ({d} rows)\n", .{from});
         return error.ReuseDidNotEngage;
