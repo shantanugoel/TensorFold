@@ -76,6 +76,8 @@ pub fn verifyPass(self: *Cuda, runs: []const geom.Run, rows: usize) !void {
     errdefer for (runs, 0..) |run, i| {
         self.m.cut(run.slot, starts[i]);
         self.seq[run.slot].kept = false;
+        // A pass that failed partway may have written ring slots up to its own last row: the mark moves with it.
+        self.bumpRows(run.slot, starts[i] + run.tokens.len);
     };
     try self.m.passRuns(runs, self.logits, .{ .at = 0, .out = self.window[0 .. rows * self.vocab], .head = rows });
     const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();

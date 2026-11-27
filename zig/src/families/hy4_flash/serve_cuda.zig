@@ -226,8 +226,13 @@ pub const Cuda = struct {
 
     /// After a pass: the ring's high-water mark, so nothing before `H + 1 - ring_rows` is readable any more.
     pub fn bump(self: *Cuda, slot: usize) void {
-        const h = self.m.len(slot);
-        const from = if (h > ring_rows) h - ring_rows else 0;
+        self.bumpRows(slot, self.m.len(slot));
+    }
+
+    /// `bump` at a pass's own last row: a pass that failed partway may still have written ring slots up to there, so a
+    /// failed pass moves the mark too (claiming fewer rows than are readable costs a reuse, not a stale read).
+    pub fn bumpRows(self: *Cuda, slot: usize, rows: usize) void {
+        const from = if (rows > ring_rows) rows - ring_rows else 0;
         self.seq[slot].valid_from = @max(self.seq[slot].valid_from, @as(u32, @intCast(from)));
     }
 
@@ -237,10 +242,12 @@ pub const Cuda = struct {
         self.logits = self.window[0..self.vocab];
         // Inside `capacity` every write slot is inside its sequence's arena: a stray one is skipped silently.
         if (start + tokens.len > self.serve_cap) return error.Hy4ContextFull;
-        // The model appends before it forwards: a failed pass leaves the history claiming rows nothing wrote.
+        // The model appends before it forwards: a failed pass leaves the history claiming rows nothing wrote, and the
+        // ring may already hold the rows it did write. Both go, and the mark moves to the failed pass's own end.
         errdefer {
             self.m.cut(slot, start);
             self.seq[slot].kept = false;
+            self.bumpRows(slot, start + tokens.len);
         }
         const t0 = std.Io.Clock.awake.now(self.io);
         try self.m.passRuns(&.{.{ .slot = slot, .tokens = tokens }}, self.logits, null);
