@@ -163,6 +163,22 @@ pub const Cuda = struct {
         return null;
     }
 
+    /// Whether the slot still holds this stream's own prompt. A released stream's address goes back to the pool and the
+    /// next request may be given it, so `slotOf`'s address is evidence only while the history it filled is the prompt's.
+    fn owns(self: *const Cuda, slot: usize, ids: []const u32) bool {
+        const q = self.seq[slot];
+        const hist = self.m.tokens(slot);
+        if (q.at > hist.len or q.at > ids.len) return false;
+        if (q.at == 0) return hist.len == 0; // nothing filled yet: a slot with history is an older request's
+        return std.mem.eql(u32, hist[0..q.at], ids[0..q.at]);
+    }
+
+    /// A slot whose old request is gone: its facts go, its caches stay kept so the new prompt may resume on them.
+    fn reclaim(self: *Cuda, slot: usize) void {
+        const from = self.seq[slot].valid_from;
+        self.seq[slot] = .{ .kept = true, .valid_from = from };
+    }
+
     /// A free slot for `s`, or NoFreeSlot: what it held stays, a kept prefix and the ring's high-water mark.
     fn openSlot(self: *Cuda, s: *lanes.Stream) !usize {
         for (self.seq[0..self.slots], 0..) |*q, i| {
@@ -173,6 +189,17 @@ pub const Cuda = struct {
             return i;
         }
         return error.NoFreeSlot;
+    }
+
+    /// A free slot for `s`, and the row its fill starts at: the kept prefix its caches still hold.
+    fn openFill(self: *Cuda, s: *lanes.Stream, ids: []const u32) !usize {
+        const i = try self.openSlot(s);
+        const q = &self.seq[i];
+        q.from = self.reuseFrom(i, ids);
+        s.cached = @intCast(q.from);
+        q.at = q.from;
+        s.fill_at.store(@intCast(q.at), .monotonic);
+        return i;
     }
 
     pub fn freeSlots(self: *const Cuda) usize {
@@ -403,15 +430,11 @@ pub const Cuda = struct {
         const ids = s.prompt();
         if (ids.len == 0) return error.EmptyHy4Prompt;
         if (ids.len + s.max_new > self.serve_cap) return error.Hy4ContextFull;
-        const slot = self.slotOf(s) orelse blk: {
-            const i = try self.openSlot(s);
-            const q = &self.seq[i];
-            q.from = self.reuseFrom(i, ids);
-            s.cached = @intCast(q.from);
-            q.at = q.from;
-            s.fill_at.store(@intCast(q.at), .monotonic);
-            break :blk i;
-        };
+        // The pool hands a released stream's address to the next request: a slot is this stream's while its own prompt
+        // is still what the slot filled, and otherwise it goes back to the free list with its caches kept.
+        const held = self.slotOf(s);
+        if (held) |i| if (!self.owns(i, ids)) self.reclaim(i);
+        const slot = if (held) |i| if (self.seq[i].stream == s) i else try self.openFill(s, ids) else try self.openFill(s, ids);
         const q = &self.seq[slot];
         if (q.at >= ids.len) return true;
         if (s.isCancelled()) {
@@ -431,6 +454,7 @@ pub const Cuda = struct {
     fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = cast(ptr);
         const slot = self.slotOf(s) orelse return;
+        if (!self.owns(slot, s.prompt())) return; // the slot is another request's now
         self.seq[slot].kept = true;
         s.keepInterruptedPrefill(@intCast(self.seq[slot].at));
     }
@@ -493,8 +517,8 @@ pub const Cuda = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = cast(ptr);
         const slot = self.slotOf(s) orelse return;
-        const from = self.seq[slot].valid_from;
-        self.seq[slot] = .{ .kept = true, .valid_from = from };
+        if (!self.owns(slot, s.prompt())) return; // the address came back with another request: not this slot's
+        self.seq[slot] = .{ .kept = true, .valid_from = self.seq[slot].valid_from };
     }
 };
 
@@ -601,6 +625,36 @@ test "a context's caches split into the KV that grows, the ring that does not an
     try std.testing.expect(ring_window == 512 and ring_rows == 3 * ring_window);
     // A size decision's rate counts everything that grows: 13,824 B of KV, 3,840 B of indexer keys, 1,024 B of scores.
     try std.testing.expectEqual(@as(u64, 18_688), bytesPerToken(&m));
+}
+
+test "a slot belongs to a stream only while the history it filled is that stream's prompt" {
+    var hist: [8]u32 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const hists = try std.testing.allocator.alloc(std.ArrayList(u32), 2);
+    defer std.testing.allocator.free(hists);
+    hists[0] = .{ .items = hist[0..4], .capacity = hist.len, .pointer_stability = .{} };
+    hists[1] = .{ .items = hist[0..0], .capacity = hist.len, .pointer_stability = .{} };
+    var m: model.Model = undefined;
+    m.capacity = 262_144;
+    m.slots = 2;
+    m.history = hists;
+    var s: lanes.Stream = undefined;
+    var c: Cuda = undefined;
+    c.m = &m;
+    c.slots = 2;
+    c.seq = @splat(Seq{});
+    c.seq[0] = .{ .stream = &s, .at = 4 };
+    // the prompt the slot filled: its stream's, whatever comes after the filled rows
+    try std.testing.expect(c.owns(0, &.{ 1, 2, 3, 4, 9, 9 }));
+    // another request's prompt behind a reused address: not this slot's, and the slot is reclaimed
+    try std.testing.expect(!c.owns(0, &.{ 1, 2, 9, 4 }));
+    try std.testing.expect(!c.owns(0, &.{ 5 }));
+    // a slot that has filled nothing owns nothing but an empty history
+    c.seq[1] = .{ .stream = &s, .at = 0 };
+    try std.testing.expect(c.owns(1, &.{ 1, 2 }));
+    hists[1] = .{ .items = hist[0..2], .capacity = hist.len, .pointer_stability = .{} };
+    try std.testing.expect(!c.owns(1, &.{ 1, 2 }));
+    c.reclaim(1);
+    try std.testing.expect(c.seq[1].stream == null and c.seq[1].kept);
 }
 
 test "a rewind is allowed exactly while the ring still holds the rows its first window reads" {
