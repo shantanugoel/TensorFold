@@ -79,11 +79,17 @@ fn memory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     return .{ .active = u.device, .cache = 0, .peak = u.peak, .pinned = u.host };
 }
 
-/// Words for a request this engine cannot serve yet: images need the tower, tools are not served.
+/// Words for a request this engine cannot serve yet: tools are not served. Images are not refused here: without
+/// `--vision` the server refuses an image part by name before any engine sees it, and with `--vision` the tower is
+/// loaded and the plan reads them (`serve_cuda.setPlan`).
 fn refusalMessage(_: *anyopaque, request: *const api.Request, out: []u8) ?[]const u8 {
-    if (request.images.len > 0) return put(out, "the Hy4-flash CUDA engine reads text only on this server: start it with --vision to send image parts");
     if (request.tools_json.len > 0) return put(out, "the Hy4-flash CUDA engine does not serve tools yet: send the request without tools");
     return null;
+}
+
+/// One image's LM tokens: `--vision-image-tokens` when given, else the family's own budget for `--vision` alone.
+fn imageTokens(v: api.VisionOpen) u32 {
+    return if (v.image_tokens_set) v.image_tokens else family.Cuda.default_image_tokens;
 }
 
 fn put(out: []u8, message: []const u8) []const u8 {
@@ -101,9 +107,10 @@ fn refuse(a: Allocator, problem: *[]const u8, comptime fmt: []const u8, args: an
 /// The flags this engine's path cannot serve yet, each with the step that brings it; null when they are all absent.
 fn refusal(a: Allocator, o: api.Open) !?[]const u8 {
     if (o.vision) |v| {
-        // One image's rows are the tower's; a request may hold `max_images` of them (the family's own limit).
+        // One image's rows are the tower's, four patches a token, and its scratch is sized for them at load.
         if (v.image_tokens > family.vision_token_limit) return try std.fmt.allocPrint(a, "--vision-image-tokens {d}: one image may take {d} tokens at most (four patches a token is the tower's scratch)", .{ v.image_tokens, family.vision_token_limit });
-        if (v.video_tokens > 0 and v.max_videos > 0) return try std.fmt.allocPrint(a, "--vision: the Hy4-flash engine reads images and no video yet: the reference's video path is not ported", .{});
+        // Video is not refused here: this tower's offer has no video half, so the server's own expansion refuses a
+        // `video_url` part by name ("this server takes no video input") and /v1/models lists none.
     }
     if (o.lanes < 1 or o.lanes > family.max_slots) return try std.fmt.allocPrint(a, "--parallel {d}: the native Hy4-flash engine serves 1 to {d} sequences", .{ o.lanes, family.max_slots });
     if (o.tp != 1 or o.rank != 0) return try std.fmt.allocPrint(a, "--tp {d} --rank {d}: the native Hy4-flash engine is one device (1 and 0)", .{ o.tp, o.rank });
@@ -179,7 +186,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const draft_lanes = @import("sys").environment.read(u32, "TF_HY4_DRAFT_LANES", 2) catch 2;
     const drafts = loadDrafts(o.lanes, draft_lanes, asked);
     if (asked > 0 and drafts == 0) std.log.info("hy4-cuda: --mtp-drafts {d} not loaded: a --parallel {d} server serves the plain path (a resident tower costs a shared pass about 10 %, step 6c; use --parallel 1, or TF_HY4_DRAFT_LANES=3 to draft in a two-lane round)", .{ asked, o.lanes });
-    const vision_tokens: u32 = if (o.vision) |v| v.image_tokens else 0;
+    const vision_tokens: u32 = if (o.vision) |v| imageTokens(v) else 0;
     h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes, vision_tokens) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
@@ -215,7 +222,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         @as(f64, @floatFromInt(bytes.ring)) / (1 << 20), @as(f64, @floatFromInt(bytes.scores)) / (1 << 20),
         gib(h.c.m.weight_bytes),      gib(avail),
         if (h.c.m.draft != null) "on" else "off",
-        if (o.vision) |v| try std.fmt.allocPrint(a, "on ({d} tokens an image)", .{v.image_tokens}) else "off",
+        if (o.vision) |v| try std.fmt.allocPrint(a, "on ({d} tokens an image)", .{imageTokens(v)}) else "off",
     });
     errdefer gpa.free(h.startup);
     h.host = api.LaneHost.init(gpa, io, &h.core, .{
@@ -288,9 +295,12 @@ test "Hy4-flash CUDA host: a bare serve is served, and every step this path lack
     const plain: api.Open = .{ .dir = "d", .model_type = model_type, .lanes = 1 };
     try std.testing.expect(try refusal(a, plain) == null);
     try std.testing.expect(try refusal(a, .{ .dir = "d", .model_type = model_type, .lanes = family.max_slots }) == null);
-    // one flag a request cannot bring yet, and the words name the flag: vision, too many lanes, an 8-bit cache
+    // --vision itself is served (`--vision` alone takes the checkpoint's own budget); past the tower's scratch is not.
+    try std.testing.expect(try refusal(a, .{ .dir = "d", .model_type = model_type, .lanes = 1, .vision = .{} }) == null);
+    // one flag a request cannot bring yet, and the words name the flag: too many image tokens, too many lanes, an
+    // 8-bit cache
     for ([_]struct { api.Open, []const u8 }{
-        .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .vision = .{} }, "--vision" },
+        .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .vision = .{ .image_tokens = family.vision_token_limit + 1, .image_tokens_set = true } }, "--vision-image-tokens" },
         .{ .{ .dir = "d", .model_type = model_type, .lanes = family.max_slots + 1 }, "--parallel 9" },
         .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .kv8 = true }, "--kv-cache fp8" },
         .{ .{ .dir = "d", .model_type = model_type, .lanes = 1, .slide = true }, "--slide" },
@@ -301,17 +311,22 @@ test "Hy4-flash CUDA host: a bare serve is served, and every step this path lack
     }
 }
 
+test "Hy4-flash CUDA host: --vision alone takes the family's own budget, and the flag overrides it" {
+    try std.testing.expectEqual(family.Cuda.default_image_tokens, imageTokens(.{}));
+    try std.testing.expectEqual(@as(u32, 1024), imageTokens(.{ .image_tokens = 1024, .image_tokens_set = true }));
+}
+
 test "Hy4-flash CUDA host: a request this engine cannot serve says which part it cannot take" {
     const a = std.testing.allocator;
     var out: [512]u8 = undefined;
     const plain: api.Request = .{ .prompt = &.{}, .max_tokens = 1 };
     try std.testing.expect(refusalMessage(undefined, &plain, &out) == null);
+    // images are the server's own refusal without --vision (media.images), so a request with them is the engine's
     const one: [1]lanes.stream.Image = .{.{ .pixels = &.{}, .gh = 1, .gw = 1, .at = 0, .tokens = 1 }};
     const image: api.Request = .{ .prompt = &.{}, .max_tokens = 1, .images = &one };
-    var problem = refusalMessage(undefined, &image, &out).?;
-    try std.testing.expect(std.mem.startsWith(u8, problem, "the Hy4-flash CUDA engine reads text only"));
+    try std.testing.expect(refusalMessage(undefined, &image, &out) == null);
     const tools: api.Request = .{ .prompt = &.{}, .max_tokens = 1, .tools_json = "[]" };
-    problem = refusalMessage(undefined, &tools, &out).?;
+    const problem = refusalMessage(undefined, &tools, &out).?;
     try std.testing.expect(std.mem.startsWith(u8, problem, "the Hy4-flash CUDA engine does not serve tools"));
     _ = a;
 }

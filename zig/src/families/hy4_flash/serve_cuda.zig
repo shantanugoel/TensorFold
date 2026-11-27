@@ -147,6 +147,9 @@ pub const Cuda = struct {
     log_rounds: bool = false,
     /// `--vision`: the tower is loaded and a prompt's images are planned and encoded.
     vision: Vision = undefined,
+    /// What `--vision` takes without `--vision-image-tokens` (`cuda_options.zig` reads it off the engine type): the
+    /// checkpoint's own budget, 4,224 tokens, which a 2048 x 2048 image's 4,160 rows fit inside.
+    pub const default_image_tokens: u32 = cuda_vision.token_limit;
 
     /// Loads the pack: `slots` sequences' caches of `capacity` positions, `prompt_rows` rows a pass, `drafts` a round.
     pub fn init(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *model.Kernels, dir: []const u8, capacity: usize, rounds: u32, slots: usize, vision_tokens: u32) !*Cuda {
