@@ -81,6 +81,8 @@ pub fn verifyPass(self: *Cuda, runs: []const geom.Run, rows: usize) !void {
     const ns = t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds();
     self.decode_rows += rows;
     self.decode_ns += ns;
+    // `TF_HY4_ROUND_LOG`: the pass's own cost by rows, so a round's wall time can be read against it.
+    if (self.log_rounds and self.decode_rows % 128 < rows) std.log.info("hy4-cuda: pass {d} rows over {d} streams in {d:.2} ms ({d:.2} ms a row, {d} rows so far)", .{ rows, runs.len, @as(f64, @floatFromInt(ns)) / 1e6, @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(@max(rows, 1))), self.decode_rows });
     for (runs) |run| self.bump(run.slot);
 }
 

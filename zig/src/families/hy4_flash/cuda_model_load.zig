@@ -134,7 +134,15 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         seen += 1;
     };
     self.engrams = engrams;
-    // DFly2's tower: the pack's `model.dfly_layers.*`, on the device only when a round holds drafts.
+    std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
+    self.weight_bytes = self.own.bytes;
+    // The indexer's GEMMs keep one row width whatever a pass takes, so it reads that many rows of the model's scratch.
+    const index_rows = if (self.capacity > sparse_stride) geom.row_cap else self.max_rows;
+    self.scratch = try geom.alloc(self.d, &self.own, @max(self.max_rows, index_rows), self.text.vocab_size);
+    self.index = try cuda_index.Scratch.init(self.d, index_rows, self.capacity);
+    try reserveDense(self);
+    // DFly2's tower last: the pass's own scratch is allocated at the addresses a plain load gives it, so a resident
+    // tower cannot move the buffers a shared round reads (it cost a 4-row pass 12 % when it came first).
     if (o.drafts > 0) {
         // The tower binds each layer to a target layer's cache and recall list. `config.zig` reads that off the
         // pack's layer types; this checks the layers the load actually built, so a ring on one of the five is caught.
@@ -150,13 +158,6 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
     }
     // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor
     try @import("loader.zig").finishCuda(ck, cfg.value, self.draft != null);
-    std.debug.print("all layers: device {d:.2} GiB, MemAvailable {d:.2} GiB\n", .{ load_util.gib(self.own.bytes), load_util.gib(load_util.memAvailable()) });
-    self.weight_bytes = self.own.bytes;
-    // The indexer's GEMMs keep one row width whatever a pass takes, so it reads that many rows of the model's scratch.
-    const index_rows = if (self.capacity > sparse_stride) geom.row_cap else self.max_rows;
-    self.scratch = try geom.alloc(self.d, &self.own, @max(self.max_rows, index_rows), self.text.vocab_size);
-    self.index = try cuda_index.Scratch.init(self.d, index_rows, self.capacity);
-    try reserveDense(self);
     // What grows with the context, so a size decision is read and not inferred: KV, indexer keys, recall scores.
     var kv_bytes: usize = 0;
     var index_bytes: usize = 0;

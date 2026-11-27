@@ -162,7 +162,12 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer h.s.deinit();
     h.k = family.Kernels.load(gpa, &h.driver) catch |e| return refuse(a, problem, "the native Hy4-flash kernel images cannot load ({s})", .{@errorName(e)});
     errdefer h.k.deinit();
-    const drafts = o.mtp_drafts orelse 0;
+    // Drafting pays on one busy lane and costs a page when the load is shared: at `--parallel 2` or more the tower is
+    // not loaded unless `TF_HY4_DRAFT_LANES` names a shared round that may draft (`TF_HY4_DRAFT_LANES=4` measures it).
+    const asked = o.mtp_drafts orelse 0;
+    const draft_lanes = @import("sys").environment.read(u32, "TF_HY4_DRAFT_LANES", 2) catch 2;
+    const drafts = if (o.lanes > 1 and draft_lanes > 1) 0 else asked;
+    if (asked > 0 and drafts == 0) std.log.info("hy4-cuda: --mtp-drafts {d} not loaded: a --parallel {d} server serves the plain path (a resident tower costs a shared pass about 10 %, step 6c; use --parallel 1, or TF_HY4_DRAFT_LANES=4 to measure)", .{ asked, o.lanes });
     h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
