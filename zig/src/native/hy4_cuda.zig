@@ -119,6 +119,15 @@ fn refusal(a: Allocator, o: api.Open) !?[]const u8 {
     return null;
 }
 
+/// The drafts a load takes. Drafting pays on one busy lane and costs a page when the load is shared, so a multi-lane
+/// server does not load the tower unless a shared round may draft there: `TF_HY4_DRAFT_LANES` is `plain_streams` — a
+/// round that many streams wide drafts none — so above two it leaves a two-stream round drafting, and at 1 it loads the
+/// tower for a measurement that never drafts. (2, the default, is the served plain path at `--parallel 2` or more.)
+fn loadDrafts(sequences: usize, draft_lanes: u32, asked: u32) u32 {
+    const shared_draft = draft_lanes > 2 or draft_lanes <= 1;
+    return if (sequences > 1 and !shared_draft) 0 else asked;
+}
+
 /// The context to serve: --context (0: the largest this engine ranks), rounded to whole 512-slot pages.
 fn contextOf(a: Allocator, o: api.Open, problem: *[]const u8) !?u32 {
     const asked: i64 = o.context orelse default_context;
@@ -162,12 +171,10 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer h.s.deinit();
     h.k = family.Kernels.load(gpa, &h.driver) catch |e| return refuse(a, problem, "the native Hy4-flash kernel images cannot load ({s})", .{@errorName(e)});
     errdefer h.k.deinit();
-    // Drafting pays on one busy lane and costs a page when the load is shared: at `--parallel 2` or more the tower is
-    // not loaded unless `TF_HY4_DRAFT_LANES` names a shared round that may draft (`TF_HY4_DRAFT_LANES=4` measures it).
     const asked = o.mtp_drafts orelse 0;
     const draft_lanes = @import("sys").environment.read(u32, "TF_HY4_DRAFT_LANES", 2) catch 2;
-    const drafts = if (o.lanes > 1 and draft_lanes > 1) 0 else asked;
-    if (asked > 0 and drafts == 0) std.log.info("hy4-cuda: --mtp-drafts {d} not loaded: a --parallel {d} server serves the plain path (a resident tower costs a shared pass about 10 %, step 6c; use --parallel 1, or TF_HY4_DRAFT_LANES=4 to measure)", .{ asked, o.lanes });
+    const drafts = loadDrafts(o.lanes, draft_lanes, asked);
+    if (asked > 0 and drafts == 0) std.log.info("hy4-cuda: --mtp-drafts {d} not loaded: a --parallel {d} server serves the plain path (a resident tower costs a shared pass about 10 %, step 6c; use --parallel 1, or TF_HY4_DRAFT_LANES=3 to draft in a two-lane round)", .{ asked, o.lanes });
     h.c = family.Cuda.init(gpa, io, &h.driver, h.s, &h.k, o.dir, capacity, drafts, o.lanes) catch |e| return refuse(a, problem, "the native Hy4-flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
     errdefer h.c.deinit();
     // The last load-time allocations are in, and a GB10's memory is the system's: read the floor here, not per layer.
@@ -239,6 +246,22 @@ fn floorRefusal(a: Allocator, capacity: u32, per_token: u64, avail: u64, floor_g
     if (fits >= capacity) return std.fmt.allocPrint(a, under ++ "even {d} tokens would not fit now", .{ capacity, gib(avail), gib(over), floor_gib, least_context });
     const slack = @max(capacity - @as(u32, @intCast(fits)), least_context);
     return std.fmt.allocPrint(a, under ++ "serve --context {d} or less", .{ capacity, gib(avail), gib(over), floor_gib, slack / 512 * 512 });
+}
+
+test "Hy4-flash CUDA host: a multi-lane server loads the tower only when a shared round may draft" {
+    // A lone stream keeps its round whole, so a one-lane server always loads it.
+    try std.testing.expectEqual(@as(u32, 5), loadDrafts(1, 2, 5));
+    // The served default: at --parallel 2 or more the switch is at 2, a shared round that wide drafts none, so the
+    // tower stays out of the load (a resident one costs a shared pass about 10 %).
+    try std.testing.expectEqual(@as(u32, 0), loadDrafts(2, 2, 5));
+    try std.testing.expectEqual(@as(u32, 0), loadDrafts(4, 2, 5));
+    // Above two the switch leaves a two-stream round drafting, so the tower is loaded for it.
+    try std.testing.expectEqual(@as(u32, 5), loadDrafts(2, 3, 5));
+    try std.testing.expectEqual(@as(u32, 5), loadDrafts(4, 4, 5));
+    // At 1 it is resident and drafts never: the measurement that prices a resident tower's cost to a shared pass.
+    try std.testing.expectEqual(@as(u32, 5), loadDrafts(4, 1, 5));
+    // A server asked for no drafts loads none whatever the switch says.
+    try std.testing.expectEqual(@as(u32, 0), loadDrafts(1, 3, 0));
 }
 
 test "Hy4-flash CUDA host: the context this engine serves: whole pages, the recall scores' width, and clear words past it" {
