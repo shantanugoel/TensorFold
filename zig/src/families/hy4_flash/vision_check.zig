@@ -7,7 +7,7 @@ const vision = @import("cuda_vision.zig");
 
 const usage = "usage: tf-hy4-vision MODEL_DIR IMAGE OUT.f32 [TOKENS] [--stages DIR] [--patches PATH]\n" ++
     "  MODEL_DIR  a pack with vit.* and its config.json\n" ++
-    "  IMAGE      PNG or JPEG bytes\n" ++
+    "  IMAGE      PNG, JPEG or WebP bytes\n" ++
     "  OUT.f32    the rows, (gh / 2) * (gw / 2 + 1) of them, 3072 FP32 each, in raster order\n" ++
     "  TOKENS     the visual-token budget an image may take (default 4224, the checkpoint's own)\n" ++
     "  --stages DIR  dump each pipeline stage as FP32 rows under DIR (a mismatch's stage)\n" ++

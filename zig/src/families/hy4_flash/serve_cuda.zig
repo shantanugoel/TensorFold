@@ -114,8 +114,8 @@ pub const Vision = struct {
     /// The processor's words for an image it cannot read; null for any other error (the server's own).
     pub fn explain(err: anyerror) ?[]const u8 {
         return switch (err) {
-            error.ImageTooSmall, error.Oversized, error.BadVisionLayout => "the image's size is outside what the vision tower reads (32 to 2048 pixels a side, under 200:1)",
-            error.NoDecoder, error.Invalid => "the image's bytes are not a JPEG or PNG this engine decodes",
+            error.ImageTooSmall, error.Oversized, error.AspectRatio, error.BadVisionLayout => "the image's size is outside what the vision tower reads (at least 32 pixels a side, at most 2,048 x 2,048 pixels, and under 200:1)",
+            error.NoDecoder, error.Invalid => "the image's bytes are not a JPEG, PNG or WebP this engine decodes",
             else => null,
         };
     }
