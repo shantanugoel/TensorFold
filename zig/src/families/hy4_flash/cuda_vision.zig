@@ -334,17 +334,20 @@ test "every tower GEMM's output fits its scratch at the patch budget" {
 }
 
 /// The tower's per-image scratch: one image's rows at a time, and the token-wise GEMMs' block.
+/// The per-image buffers are the tower's own allocations, not the weight uploader's: the slabs a load carves weights
+/// from counted the scratch as weights (a 4,224-token budget read +2.26 GiB against 0.87 GiB of weights), and a slab's
+/// tail is wasted whatever the scratch's last buffers would have fitted in it.
 pub const Scratch = struct {
     patches: cuda.DeviceBuffer, // the raw patch rows, BF16
     pos: cuda.DeviceBuffer, // their interpolated position rows, then the sum
     attention: cuda.DeviceBuffer,
-    h: u64, // a LayerNorm's rows
-    qkv: u64,
-    tmp: u64, // a fused-bias GEMM's own output, when the residual is in place
-    ff: u64, // the MLP's 4304-wide rows
-    acc: u64, // f32 rows: the GEMM fallback's accumulator
-    merged: u64, // the unshuffled 4608-wide rows
-    proj: u64, // the projector's H-wide rows
+    h: cuda.DeviceBuffer, // a LayerNorm's rows
+    qkv: cuda.DeviceBuffer,
+    tmp: cuda.DeviceBuffer, // a fused-bias GEMM's own output, when the residual is in place
+    ff: cuda.DeviceBuffer, // the MLP's 4304-wide rows and the merge GEMM's 4608-wide ones
+    acc: cuda.DeviceBuffer, // f32 rows: the GEMM fallback's accumulator
+    merged: cuda.DeviceBuffer, // the unshuffled 4608-wide rows
+    proj: cuda.DeviceBuffer, // the projector's H-wide rows
     newline: u64, // one row: `image_newline`, copied into place at the end of every merged row
 };
 
@@ -370,8 +373,11 @@ pub const Tower = struct {
     patches_max: usize,
     /// A debugging run's stage dumps (the boundary check narrows a mismatch to one stage): null in a server.
     stages: ?Stages = null,
-    /// Device bytes the tower's weights take, read at load so a size report counts it.
+    /// Device bytes the tower's weights take: what the load added to the uploader (a server's uploader also holds the
+    /// text weights, so the total is not the tower's).
     bytes: usize,
+    /// Device bytes the per-image scratch takes, in its own allocations beside the weights (`sizes`).
+    scratch_bytes: usize,
 
     /// Loads `vit.*` from `ck` for images of at most `tokens` LM tokens (`patches_max` = 4 x tokens patches).
     pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, gemms: *cuda.vit.Gemms, glue: *cuda.vit.Kernels, attention: *cuda.vit.Attention, norms: *const cuda.norms.Norms, ck: *core.Checkpoint, own: *cuda.exl3_upload.Uploader, cfg: vc.Config, tokens: u32) !*Tower {
@@ -380,6 +386,7 @@ pub const Tower = struct {
         if (tokens == 0 or tokens > token_limit) return error.BadHy4VisionLimits;
         const self = try a.create(Tower);
         errdefer a.destroy(self);
+        const weights_before = own.bytes;
         const layers = try a.alloc(Layer, cfg.depth);
         errdefer a.free(layers);
         const mapped = try ck.get("vit.embeddings.position_embedding.weight");
@@ -406,6 +413,7 @@ pub const Tower = struct {
             .patches_max = 4 * @as(usize, tokens),
             .stages = null,
             .bytes = 0,
+            .scratch_bytes = 0,
         };
         for (layers, 0..) |*layer, i| layer.* = try loadLayer(own, ck, i);
         self.perceive = .{
@@ -415,18 +423,28 @@ pub const Tower = struct {
             .out = try take(own, ck, "vit.perceive.", "proj.2.weight", .bf16, &.{ H, merge_width, 1, 1 }),
             .out_bias = try take(own, ck, "vit.perceive.", "proj.2.bias", .bf16, &.{H}),
         };
-        self.scratch = try allocScratch(d, own, self.patches_max);
+        self.scratch = try allocScratch(d, self.patches_max);
         self.scratch.newline = self.newline;
-        self.bytes = own.bytes;
+        self.bytes = own.bytes - weights_before;
+        const sz = sizes(self.patches_max);
+        self.scratch_bytes = sz.patches + sz.pos + sz.attention + sz.h + sz.qkv + sz.tmp + sz.ff + sz.acc + sz.merged + sz.proj;
         return self;
     }
 
     pub fn deinit(self: *Tower) void {
         const a = self.a;
+        // The weights go with the uploader that owns them; everything this tower allocated itself goes here.
         var sc = self.scratch;
         sc.patches.free();
         sc.pos.free();
         sc.attention.free();
+        sc.h.free();
+        sc.qkv.free();
+        sc.tmp.free();
+        sc.ff.free();
+        sc.acc.free();
+        sc.merged.free();
+        sc.proj.free();
         a.free(self.table);
         a.free(self.layers);
         a.destroy(self);
@@ -462,31 +480,31 @@ pub const Tower = struct {
         defer tmp.free(up);
         for (patches, up) |v, *w| w.* = bf16(v);
         try sc.patches.uploadAsync(0, std.mem.sliceAsBytes(up), s.handle);
-        try cuda.vit.linear(self.gemms, self.glue, s, sc.acc, sc.patches.ptr, self.patch, self.patch_bias, sc.h, count, hidden, patch_width);
-        try self.stage(sc.h, count, hidden, "patchemb.f32");
+        try cuda.vit.linear(self.gemms, self.glue, s, sc.acc.ptr, sc.patches.ptr, self.patch, self.patch_bias, sc.h.ptr, count, hidden, patch_width);
+        try self.stage(sc.h.ptr, count, hidden, "patchemb.f32");
         const pos = try self.positionRows(gh, gw);
         defer tmp.free(pos);
         try sc.pos.uploadAsync(0, std.mem.sliceAsBytes(pos), s.handle);
         try self.stage(sc.pos.ptr, count, hidden, "pos.f32");
         // x lives in `sc.pos` from here: the patch rows plus their position rows, rounded once, as torch's `emb + pos`.
-        try self.glue.pointwise(s, sc.h, sc.pos.ptr, sc.pos.ptr, count * hidden, .none);
+        try self.glue.pointwise(s, sc.h.ptr, sc.pos.ptr, sc.pos.ptr, count * hidden, .none);
         try self.stage(sc.pos.ptr, count, hidden, "embed.f32");
         // 27 x (LayerNorm, full non-causal attention, LayerNorm, GELU MLP). The attention is one frame: every patch of
         // this image over every other, which is the reference's cu_seqlens segment for it.
         for (self.layers, 0..) |layer, layer_index| {
-            try self.glue.layerNorm(s, sc.pos.ptr, layer.ln1, layer.ln1_bias, sc.h, count, hidden, self.cfg.eps);
-            if (layer_index == 0) try self.stage(sc.h, count, hidden, "l0-norm.f32");
-            try cuda.vit.linear(self.gemms, self.glue, s, sc.acc, sc.h, layer.qkv, layer.qkv_bias, sc.qkv, count, 3 * hidden, hidden);
-            try self.attention.full(s, sc.qkv, sc.attention.ptr, count, heads, dim, 1.0 / @sqrt(@as(f32, dim)));
+            try self.glue.layerNorm(s, sc.pos.ptr, layer.ln1, layer.ln1_bias, sc.h.ptr, count, hidden, self.cfg.eps);
+            if (layer_index == 0) try self.stage(sc.h.ptr, count, hidden, "l0-norm.f32");
+            try cuda.vit.linear(self.gemms, self.glue, s, sc.acc.ptr, sc.h.ptr, layer.qkv, layer.qkv_bias, sc.qkv.ptr, count, 3 * hidden, hidden);
+            try self.attention.full(s, sc.qkv.ptr, sc.attention.ptr, count, heads, dim, 1.0 / @sqrt(@as(f32, dim)));
             if (layer_index == 0) try self.stage(sc.attention.ptr, count, hidden, "l0-attn.f32");
-            try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.attention.ptr, layer.out, layer.out_bias, sc.tmp, count, hidden, hidden, sc.pos.ptr, sc.pos.ptr, .none);
-            try self.glue.layerNorm(s, sc.pos.ptr, layer.ln2, layer.ln2_bias, sc.h, count, hidden, self.cfg.eps);
+            try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc.ptr, sc.attention.ptr, layer.out, layer.out_bias, sc.tmp.ptr, count, hidden, hidden, sc.pos.ptr, sc.pos.ptr, .none);
+            try self.glue.layerNorm(s, sc.pos.ptr, layer.ln2, layer.ln2_bias, sc.h.ptr, count, hidden, self.cfg.eps);
             var at: usize = 0;
             while (at < count) : (at += block_rows) {
                 const n = @min(block_rows, count - at);
                 const row = sc.pos.ptr + at * hidden * 2;
-                try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.h + at * hidden * 2, layer.up, layer.up_bias, sc.ff, n, inner, hidden, null, sc.ff, .gelu);
-                try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.ff, layer.down, layer.down_bias, sc.tmp, n, hidden, inner, row, row, .none);
+                try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc.ptr, sc.h.ptr + at * hidden * 2, layer.up, layer.up_bias, sc.ff.ptr, n, inner, hidden, null, sc.ff.ptr, .gelu);
+                try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc.ptr, sc.ff.ptr, layer.down, layer.down_bias, sc.tmp.ptr, n, hidden, inner, row, row, .none);
             }
             if (layer_index == 0) try self.stage(sc.pos.ptr, count, hidden, "l0.f32") else if (layer_index == 1) try self.stage(sc.pos.ptr, count, hidden, "l1.f32");
         }
@@ -502,21 +520,21 @@ pub const Tower = struct {
         const mw: usize = gw / merge;
         const merged = mh * mw;
         // The reference normalizes in float32, casts back, then scales: MLX's bf16 steps are that exactly.
-        try self.norms.addRmsTail(s, sc.pos.ptr, null, self.perceive.norm, sc.h, sc.h, null, count, hidden, self.cfg.eps, .{ .round = true });
-        try self.glue.unshuffle(s, sc.h, sc.qkv, gh, gw, hidden);
-        try self.glue.convFlatten(s, sc.qkv, sc.merged, merged, merge * merge, 1, hidden);
+        try self.norms.addRmsTail(s, sc.pos.ptr, null, self.perceive.norm, sc.h.ptr, sc.h.ptr, null, count, hidden, self.cfg.eps, .{ .round = true });
+        try self.glue.unshuffle(s, sc.h.ptr, sc.qkv.ptr, gh, gw, hidden);
+        try self.glue.convFlatten(s, sc.qkv.ptr, sc.merged.ptr, merged, merge * merge, 1, hidden);
         var at: usize = 0;
         while (at < merged) : (at += block_rows) {
             const n = @min(block_rows, merged - at);
-            try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc, sc.merged + at * merge_width * 2, self.perceive.merge, self.perceive.merge_bias, sc.ff, n, merge_width, merge_width, null, sc.ff, .gelu);
-            try cuda.vit.linear(self.gemms, self.glue, s, sc.acc, sc.ff, self.perceive.out, self.perceive.out_bias, sc.proj + at * H * 2, n, H, merge_width);
+            try cuda.vit.linearAct(self.gemms, self.glue, s, sc.acc.ptr, sc.merged.ptr + at * merge_width * 2, self.perceive.merge, self.perceive.merge_bias, sc.ff.ptr, n, merge_width, merge_width, null, sc.ff.ptr, .gelu);
+            try cuda.vit.linear(self.gemms, self.glue, s, sc.acc.ptr, sc.ff.ptr, self.perceive.out, self.perceive.out_bias, sc.proj.ptr + at * H * 2, n, H, merge_width);
         }
-        try self.stage(sc.proj, merged, H, "proj.f32");
+        try self.stage(sc.proj.ptr, merged, H, "proj.f32");
         // Every merged row's own row goes where the prompt's placeholders are, the newline vector one past its end.
         const dst = cuda.DeviceBuffer{ .d = self.d, .ptr = out, .len = mh * (mw + 1) * H * 2, .borrowed = true };
         var oh: usize = 0;
         while (oh < mh) : (oh += 1) {
-            try dst.copyFrom((oh * (mw + 1)) * H * 2, sc.proj + oh * mw * H * 2, mw * H * 2, s.handle);
+            try dst.copyFrom((oh * (mw + 1)) * H * 2, sc.proj.ptr + oh * mw * H * 2, mw * H * 2, s.handle);
             try dst.copyFrom((oh * (mw + 1) + mw) * H * 2, sc.newline, H * 2, s.handle);
         }
     }
@@ -601,28 +619,21 @@ fn take(own: *cuda.exl3_upload.Uploader, ck: *core.Checkpoint, prefix: []const u
 }
 
 /// The tower's per-image scratch: one image's rows at a time, and the token-wise GEMMs' block.
-fn allocScratch(d: *const cuda.Driver, own: *cuda.exl3_upload.Uploader, patches_max: usize) !Scratch {
+fn allocScratch(d: *const cuda.Driver, patches_max: usize) !Scratch {
     const sz = sizes(patches_max);
     var sc: Scratch = undefined;
     sc.patches = try cuda.DeviceBuffer.alloc(d, sz.patches);
     sc.pos = try cuda.DeviceBuffer.alloc(d, sz.pos);
     sc.attention = try cuda.DeviceBuffer.alloc(d, sz.attention);
-    sc.h = try zeros(own, sz.h);
-    sc.qkv = try zeros(own, sz.qkv);
-    sc.tmp = try zeros(own, sz.tmp);
-    sc.ff = try zeros(own, sz.ff);
-    sc.acc = try zeros(own, sz.acc);
-    sc.merged = try zeros(own, sz.merged);
-    sc.proj = try zeros(own, sz.proj);
+    sc.h = try cuda.DeviceBuffer.alloc(d, sz.h);
+    sc.qkv = try cuda.DeviceBuffer.alloc(d, sz.qkv);
+    sc.tmp = try cuda.DeviceBuffer.alloc(d, sz.tmp);
+    sc.ff = try cuda.DeviceBuffer.alloc(d, sz.ff);
+    sc.acc = try cuda.DeviceBuffer.alloc(d, sz.acc);
+    sc.merged = try cuda.DeviceBuffer.alloc(d, sz.merged);
+    sc.proj = try cuda.DeviceBuffer.alloc(d, sz.proj);
     sc.newline = 0; // filled by `Tower.load` once `image_newline` is up
     return sc;
-}
-
-fn zeros(own: *cuda.exl3_upload.Uploader, bytes: usize) !u64 {
-    const z = try std.heap.page_allocator.alloc(u8, bytes);
-    defer std.heap.page_allocator.free(z);
-    @memset(z, 0);
-    return own.dev(z);
 }
 
 fn readBf16(v: u16) f32 {

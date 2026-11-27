@@ -163,7 +163,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Str
         try self.loadVision(dir, o.vision_tokens);
         ck.release();
         const tower = self.vision.?;
-        std.debug.print("image tower: {d} layers, {d:.2} GiB of weights and {d:.0} MiB of scratch for {d} patches an image\n", .{ tower.layers.len, @as(f64, @floatFromInt(tower.bytes)) / (1 << 30), @as(f64, @floatFromInt(tower.scratch.patches.len + tower.scratch.pos.len + tower.scratch.attention.len)) / (1 << 20), tower.patches_max });
+        std.debug.print("image tower: {d} layers, {d:.2} GiB of weights and {d:.0} MiB of its own scratch for {d} patches an image\n", .{ tower.layers.len, @as(f64, @floatFromInt(tower.bytes)) / (1 << 30), @as(f64, @floatFromInt(tower.scratch_bytes)) / (1 << 20), tower.patches_max });
         self.weight_bytes = self.own.bytes;
     }
     // the checkpoint's last read: `ck` is this open's own — a name never taken is a stray tensor

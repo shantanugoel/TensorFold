@@ -78,5 +78,5 @@ pub fn main(init: std.process.Init) !void {
     const floats = try a.alloc(f32, words.len);
     for (floats, words) |*f, w| f.* = @bitCast(@as(u32, w) << 16);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[3], .data = std.mem.sliceAsBytes(floats) });
-    std.debug.print("encoded {d} rows in {d:.1} ms ({d:.1} GiB of weights and scratch)\n", .{ rows, ms, @as(f64, @floatFromInt(tower.bytes)) / (1 << 30) });
+    std.debug.print("encoded {d} rows in {d:.1} ms ({d:.2} GiB of weights, {d:.0} MiB of its own scratch)\n", .{ rows, ms, @as(f64, @floatFromInt(tower.bytes)) / (1 << 30), @as(f64, @floatFromInt(tower.scratch_bytes)) / (1 << 20) });
 }
